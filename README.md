@@ -1,4 +1,4 @@
-# 端口转发一键脚本（基于 realm）
+# 端口转发一键脚本
 
 全中文菜单，小白跟着提示填就行。基于高性能转发工具 [realm](https://github.com/zhboner/realm)（TCP 和 UDP 一起转）。
 

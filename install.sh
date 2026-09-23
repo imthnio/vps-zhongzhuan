@@ -11,8 +11,8 @@
 #   2. 添加转发规则：别人访问「这台机器:端口A」→ 自动转到「目标:端口B」
 #   3. 查看 / 删除规则，重启服务、看状态，一键卸载
 #
-# 一键运行（复制粘贴下面这一行）：
-#   wget -qO install.sh https://raw.githubusercontent.com/imthnio/duankouzhuanfa/main/install.sh && sudo bash install.sh
+# 一键运行：复制 README 里的"一键运行"命令（会自动装缺的工具）。
+# 不要用 管道 | bash 的方式运行，否则进不了交互菜单。
 #
 # 装好之后，以后直接在终端输入 zhuanfa 就能打开管理菜单。
 #
@@ -698,10 +698,9 @@ status) detect_os; show_status;;
 ""|menu)
 # 没给参数 → 进交互菜单。但如果是管道方式运行（stdin 不是终端），
 # read 会直接读到 EOF，菜单会瞎转。与其这样，不如直接告诉正确的打开方式。
-if [ ! -t 0]; then
+if [ ! -t 0 ]; then
 say_err "检测到不是交互终端，菜单需要键盘输入，进不去。"
-say_info "请先下载再运行（这样才能进菜单）："
-say_info " wget -qO install.sh https://raw.githubusercontent.com/imthnio/duankouzhuanfa/main/install.sh && sudo bash install.sh"
+say_info '不要用 管道 | bash 的方式运行，请复制 README 里的"一键运行"命令。'
 exit 1
 fi
 need_root; detect_os; install_deps

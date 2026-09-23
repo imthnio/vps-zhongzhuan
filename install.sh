@@ -1,6 +1,6 @@
 #!/bin/bash
 #======================================================================
-# 端口转发一键脚本（基于 realm）
+# 端口转发一键脚本
 #----------------------------------------------------------------------
 # realm 是什么？
 #   一个用 Rust 写的高性能端口转发工具：单文件、不用装运行环境、
@@ -204,16 +204,19 @@ detect_arch() {
 get_realm_version() {
     # 先问 GitHub API 拿最新版本号；问不到（比如 GitHub 连不上）就用内置版本保底，
     # 反正下载时还有镜像可以轮询，不至于卡死。
-    say_info "正在查询 realm 最新版本…"
+    # 注意：下面这三个提示必须走 stderr（>&2）！
+    # 因为调用处是 ver="$(get_realm_version)"，只取 stdout 的最后一行当版本号，
+    # 提示如果混进 stdout，会把版本号污染成多行乱码，下载链接就拼错了，安装必失败。
+    say_info "正在查询 realm 最新版本…" >&2
     local ver=""
     ver="$(curl -fsSL --connect-timeout 8 --max-time 15 \
         "https://api.github.com/repos/$UPSTREAM_REPO/releases/latest" 2>/dev/null \
         | grep -o '"tag_name": *"[^" ]*"' | head -1 | cut -d'"' -f4)"
     if [ -n "$ver" ]; then
-        say_ok "官方最新版本：$ver"
+        say_ok "官方最新版本：$ver" >&2
     else
         ver="$REALM_PIN_VERSION"
-        say_warn "查不到最新版本（可能 GitHub 连不上），用内置版本 $ver 继续"
+        say_warn "查不到最新版本（可能 GitHub 连不上），用内置版本 $ver 继续" >&2
     fi
     echo "$ver"
 }
@@ -403,10 +406,57 @@ open_firewall() {
             iptables -I INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1
         iptables -C INPUT -p udp --dport "$port" -j ACCEPT >/dev/null 2>&1 || \
             iptables -I INPUT -p udp --dport "$port" -j ACCEPT >/dev/null 2>&1
+        save_firewall  # 规则存盘，重启后还在
         say_ok "系统防火墙已放行 $port（iptables，TCP+UDP）"
         return 0
     fi
     say_warn "没找到能用的防火墙工具，端口 $port 没自动放行；如果外面连不进来，先检查防火墙/安全组"
+}
+
+close_firewall() {
+    # 回收 open_firewall 放行的端口：删规则时调用，免得端口一直敞着。
+    # 删不存在的规则会报错，全部重定向掉，不打扰用户。
+    local port="$1" proto
+    if command -v ufw >/dev/null 2>&1; then
+        ufw --force delete allow "$port"/tcp >/dev/null 2>&1
+        ufw --force delete allow "$port"/udp >/dev/null 2>&1
+    fi
+    if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        firewall-cmd --permanent --remove-port="$port"/tcp >/dev/null 2>&1
+        firewall-cmd --permanent --remove-port="$port"/udp >/dev/null 2>&1
+        firewall-cmd --reload >/dev/null 2>&1
+    fi
+    if command -v iptables >/dev/null 2>&1; then
+        # 循环删：万一之前重复加过几条，一次清干净
+        for proto in tcp udp; do
+            while iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT >/dev/null 2>&1; do
+                iptables -D INPUT -p "$proto" --dport "$port" -j ACCEPT >/dev/null 2>&1 || break
+            done
+        done
+    fi
+    return 0
+}
+
+save_firewall() {
+    # 把当前 iptables 规则存盘，重启后还在。
+    # ufw / firewalld 自己会持久化，不用管；只有纯 iptables 需要手动存。
+    # 尽力而为：存失败也不报错，不影响主流程。
+    if [ "$PKG_MGR" = "apk" ]; then
+        # Alpine：iptables 服务负责存盘和开机恢复
+        if [ -f /etc/init.d/iptables ]; then
+            rc-update add iptables default >/dev/null 2>&1
+            /etc/init.d/iptables save >/dev/null 2>&1
+        fi
+        return 0
+    fi
+    # Debian/Ubuntu：靠 iptables-persistent（netfilter-persistent save）
+    if command -v netfilter-persistent >/dev/null 2>&1; then
+        netfilter-persistent save >/dev/null 2>&1
+    elif command -v iptables-save >/dev/null 2>&1; then
+        DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent >/dev/null 2>&1
+        command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1
+    fi
+    return 0
 }
 
 get_public_ip() {
@@ -573,6 +623,8 @@ rule_exists "$lport" || { say_err "端口 $lport 没有对应的规则"; return 
 sed -i "/^$lport|/d" "$RULES_FILE"
 gen_config
 service_restart >/dev/null 2>&1 || true
+close_firewall "$lport"  # 回收这条规则放行的防火墙端口
+save_firewall
 say_ok "已删除端口 $lport 的规则"
 }
 
@@ -617,6 +669,12 @@ say_warn "即将删除：realm 程序、系统服务、全部转发规则和配�
 if [ "${UNINSTALL_CONFIRM:-}" != "yes" ]; then
 ask_yes "确认卸载吗" "n" || { say_info "已取消"; return 1;}
 fi
+# 先记下规则里的端口：稍后回收对应的防火墙放行规则，
+# 记晚了（CONF_DIR 删掉之后）就找不到了
+local ports="" p
+if [ -f "$RULES_FILE" ]; then
+ports="$(grep -v '^#' "$RULES_FILE" 2>/dev/null | grep -v '^$' 2>/dev/null | cut -d'|' -f1 | tr '\n' ' ' || true)"
+fi
 service_stop >/dev/null 2>&1 || true
 if [ "$INIT_SYSTEM" = "openrc" ]; then
 rc-update del realm default >/dev/null 2>&1 || true
@@ -626,6 +684,8 @@ systemctl disable realm >/dev/null 2>&1 || true
 rm -f /etc/systemd/system/realm.service
 systemctl daemon-reload >/dev/null 2>&1 || true
 fi
+for p in $ports; do close_firewall "$p"; done  # 回收所有规则放行的端口
+save_firewall
 rm -f "$BIN_PATH" "$SHORTCUT"
 rm -rf "$CONF_DIR"
 say_ok "卸载完成，干干净净"

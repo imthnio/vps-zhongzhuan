@@ -7,15 +7,10 @@
 ## 一键运行
 
 ```bash
-# 先下载，再运行（这样才能进交互菜单）
-wget -qO install.sh https://raw.githubusercontent.com/imthnio/duankouzhuanfa/main/install.sh && sudo bash install.sh
+sh -c 'cd /tmp; for pm in "apk add --no-cache" "apt-get install -y" "yum install -y" "dnf install -y"; do b=${pm%% *}; command -v $b >/dev/null 2>&1 || continue; [ $b = apt-get ] && { apt-get update -qq 2>/dev/null || sudo apt-get update -qq 2>/dev/null; }; $pm bash curl wget sudo ca-certificates 2>/dev/null || sudo $pm bash curl wget sudo ca-certificates 2>/dev/null; break; done; ok=""; for u in https://raw.githubusercontent.com/imthnio/duankouzhuanfa/main/install.sh https://cdn.jsdelivr.net/gh/imthnio/duankouzhuanfa@main/install.sh; do (wget -qO install.sh "$u" || curl -fsSL -o install.sh "$u") 2>/dev/null && [ -s install.sh ] && head -1 install.sh | grep -q "^#!/bin/bash" && { ok=1; break; }; rm -f install.sh; done; [ -n "$ok" ] || { echo "下载 install.sh 失败，请检查网络"; exit 1; }; sudo bash install.sh 2>/dev/null || bash install.sh'
 ```
 
-- Alpine 用户先装基础工具：`apk update && apk add bash curl wget sudo`
-- 如果上面那行下载慢/失败，换 jsdelivr 镜像：
-  ```bash
-  wget -qO install.sh https://cdn.jsdelivr.net/gh/imthnio/duankouzhuanfa@main/install.sh && sudo bash install.sh
-  ```
+上面这一行会自动识别系统（Debian / Ubuntu / Alpine …），缺 bash、curl、wget 这些基础工具就自己装，下载时 GitHub 和 jsdelivr 两个源自动切换，全程不用你动手。
 
 装好后，以后直接在终端输入 `zhuanfa` 就能打开管理菜单。
 
@@ -37,37 +32,3 @@ wget -qO install.sh https://raw.githubusercontent.com/imthnio/duankouzhuanfa/mai
 ```
 
 添加规则时是四步向导，每一步都有中文说明：填本机监听端口 → 填目标地址 → 填目标端口 → 写备注（可选），最后跟你确认一遍，还会顺手测一下目标通不通。
-
-## 脚本会自动做的事
-
-- 按顺序试多个下载源（GitHub 直连 + 加速镜像），哪个能下用哪个
-- 检测系统：Debian/Ubuntu 用 systemd，Alpine 用 OpenRC，服务文件自己生成
-- realm 设为开机自启，崩溃自动重启
-- 自动放行系统防火墙端口（ufw / firewalld / iptables）
-- 加完规则自动重启服务，并确认端口真的在监听
-
-## 支持的环境
-
-- 系统：Debian / Ubuntu / Alpine
-- 架构：x86_64、aarch64、armv7、armv6（自动识别）
-
-## 转发不通？按顺序查
-
-1. 菜单 6 看服务是不是"运行中"
-2. 云厂商的安全组/防火墙有没有放行监听端口（脚本只管系统防火墙，云控制台那个要自己去开）
-3. 目标地址:端口现在通不通（添加规则时脚本会顺手测一次）
-4. 监听端口是不是被别的程序占了（添加时会提醒）
-
-## 非交互用法（给老手写脚本调用）
-
-```bash
-sudo ACTION=add LISTEN_PORT=10000 TARGET_ADDR=1.2.3.4 TARGET_PORT=443 NOTE="备注" bash install.sh
-sudo ACTION=del LISTEN_PORT=10000 bash install.sh
-sudo bash install.sh list
-sudo bash install.sh status
-sudo UNINSTALL_CONFIRM=yes bash install.sh uninstall
-```
-
-## 卸载
-
-菜单选 7，或 `sudo bash install.sh uninstall`，程序、服务、规则一次清干净。

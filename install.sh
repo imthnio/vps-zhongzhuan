@@ -168,11 +168,22 @@ install_deps() {
             say_warn "apt-get update 出错了，最后几行日志："
             tail -n 5 "$CURL_LOG" 2>/dev/null | sed 's/^/  /'
         fi
-        if ! apt-get install -y "${need[@]}" >>"$CURL_LOG" 2>&1; then
-            say_err "依赖安装失败，最后几行日志："
-            tail -n 8 "$CURL_LOG" 2>/dev/null | sed 's/^/  /'
-            exit 1
-        fi
+        # 刚开机的机器常有系统自动更新占着 dpkg 锁：
+        # DPkg::Lock::Timeout 让 apt 自己等锁 120 秒，还不行就多试几轮，
+        # 免得上来就报错走人（L2TP-VPS 那边已经踩过这个坑）。
+        local i
+        for i in 1 2 3 4 5; do
+            if apt-get install -y -o DPkg::Lock::Timeout=120 "${need[@]}" >>"$CURL_LOG" 2>&1; then
+                break
+            fi
+            if [ "$i" -eq 5 ]; then
+                say_err "依赖安装失败（试了 5 次），最后几行日志："
+                tail -n 8 "$CURL_LOG" 2>/dev/null | sed 's/^/  /'
+                exit 1
+            fi
+            say_warn "第 $i 次安装没成功（可能 dpkg 锁被系统更新占着），15 秒后重试…"
+            sleep 15
+        done
     else
         if ! apk add --no-cache "${need[@]}" >>"$CURL_LOG" 2>&1; then
             say_err "依赖安装失败，最后几行日志："
@@ -298,7 +309,7 @@ service_is_active() {
     else [ "$(systemctl is-active realm 2>/dev/null)" = "active" ]; fi
 }
 service_is_enabled() {
-    if [ "$INIT_SYSTEM" = "openrc" ]; then rc-update show default 2>/dev/null | grep -q "realm"
+    if [ "$INIT_SYSTEM" = "openrc" ]; then rc-update show default 2>/dev/null | grep -qw "realm"
     else [ "$(systemctl is-enabled realm 2>/dev/null)" = "enabled" ]; fi
 }
 
@@ -352,9 +363,21 @@ EOF
 #   监听端口|目标地址|目标端口|备注
 # 比如：
 #   10000|8.8.8.8|443|转发到香港落地机
+ensure_rules_file() {
+    # 规则清单不存在就建一个（含 /etc/realm 目录），顺手写一行格式说明。
+    # # 开头的是注释，gen_config / list_rules / del_rule 都会跳过，不影响使用。
+    if [ ! -f "$RULES_FILE" ]; then
+        mkdir -p "$CONF_DIR"
+        printf '# 格式：监听端口|目标地址|目标端口|备注\n' > "$RULES_FILE"
+    fi
+}
+
 gen_config() {
     # 每次增删规则后都调它，根据 rules.list 重新生成 realm 的 config.json。
     # realm 的 v2 版用 JSON 配置：endpoints 里一条就是一条转发。
+    # 先建目录：防止极端情况（比如有人手贱删了 /etc/realm）下重定向写文件失败，
+    # 连带后面的重启、验端口全跟着报错，把人看懵。
+    mkdir -p "$CONF_DIR"
     {
         echo '{'
         echo '  "log": {"level": "warn", "output": "stdout"},'
@@ -415,25 +438,41 @@ open_firewall() {
 
 close_firewall() {
     # 回收 open_firewall 放行的端口：删规则时调用，免得端口一直敞着。
+    # 后端选择跟 open_firewall 保持一致（ufw → firewalld → iptables），
+    # 只动"当初可能用过的"那个后端，不碰其他后端的规则——
+    # 以前是三个后端挨个删，万一用户在 iptables 里手写过一条一模一样的规则，
+    # 会被我们误删掉。
     # 删不存在的规则会报错，全部重定向掉，不打扰用户。
-    local port="$1" proto
-    if command -v ufw >/dev/null 2>&1; then
+    local port="$1" proto backend=""
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+        backend="ufw"
+    elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        backend="firewalld"
+    elif command -v iptables >/dev/null 2>&1; then
+        backend="iptables"
+    fi
+    case "$backend" in
+    ufw)
         ufw --force delete allow "$port"/tcp >/dev/null 2>&1
         ufw --force delete allow "$port"/udp >/dev/null 2>&1
-    fi
-    if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        ;;
+    firewalld)
         firewall-cmd --permanent --remove-port="$port"/tcp >/dev/null 2>&1
         firewall-cmd --permanent --remove-port="$port"/udp >/dev/null 2>&1
         firewall-cmd --reload >/dev/null 2>&1
-    fi
-    if command -v iptables >/dev/null 2>&1; then
+        ;;
+    iptables)
         # 循环删：万一之前重复加过几条，一次清干净
         for proto in tcp udp; do
             while iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT >/dev/null 2>&1; do
                 iptables -D INPUT -p "$proto" --dport "$port" -j ACCEPT >/dev/null 2>&1 || break
             done
         done
-    fi
+        ;;
+    *)
+        say_warn "没找到能用的防火墙工具，端口 $port 的放行规则没自动回收；如果之前放行过，手动检查一下"
+        ;;
+    esac
     return 0
 }
 
@@ -521,6 +560,13 @@ need_installed || return 1
 local lport="${LISTEN_PORT:-}" raddr="${TARGET_ADDR:-}" rport="${TARGET_PORT:-}" note="${NOTE:-}"
 if [ -z "$lport$raddr$rport" ]; then
 # ---------------- 交互式向导 ----------------
+# 非交互终端（stdin 不是键盘，比如被重定向/管道占了）下 read 会直接读到 EOF，
+# 下面的 while 循环会死循环刷屏。与其这样，不如直接报错指条明路。
+if [ ! -t 0 ]; then
+say_err "当前不是交互终端，进不了填表向导。请把三个参数一次传进来："
+say_err '  LISTEN_PORT=10000 TARGET_ADDR=1.2.3.4 TARGET_PORT=443 NOTE="备注" bash install.sh add'
+return 1
+fi
 echo ""
 say_info "========== 添加转发规则 =========="
 say_info "先理解一句话：转发 = 别人访问→ 自动转到"
@@ -593,7 +639,7 @@ is_target_addr "$raddr" || { say_err "TARGET_ADDR 不合法：$raddr"; return 1;
 is_port "$rport" || { say_err "TARGET_PORT 不合法：$rport"; return 1;}
 fi
 # 写入规则清单（同端口旧规则先删掉，保证一个端口只对应一条）
-[ -f "$RULES_FILE" ] || touch "$RULES_FILE"
+ensure_rules_file
 sed -i "/^$lport|/d" "$RULES_FILE" 2>/dev/null || true
 echo "$lport|$raddr|$rport|$note" >> "$RULES_FILE"
 open_firewall "$lport"
@@ -637,7 +683,7 @@ install_deps
 install_realm_bin
 write_service
 # 保证规则清单和配置文件存在。注意：已有规则不会被清空，放心重装。
-[ -f "$RULES_FILE" ] || : > "$RULES_FILE"
+ensure_rules_file
 gen_config
 say_info "正在启动服务…"
 if service_restart && sleep 1 && service_is_active; then

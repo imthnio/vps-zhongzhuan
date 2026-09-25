@@ -7,10 +7,10 @@
 ## 一键运行
 
 ```bash
-sh -c 'cd /tmp; for pm in "apk add --no-cache" "apt-get install -y" "yum install -y" "dnf install -y"; do b=${pm%% *}; command -v $b >/dev/null 2>&1 || continue; [ $b = apt-get ] && { apt-get update -qq 2>/dev/null || sudo apt-get update -qq 2>/dev/null; }; $pm bash curl wget sudo ca-certificates 2>/dev/null || sudo $pm bash curl wget sudo ca-certificates 2>/dev/null; break; done; ok=""; for u in https://raw.githubusercontent.com/imthnio/vps-zhongzhuan/main/install.sh https://cdn.jsdelivr.net/gh/imthnio/vps-zhongzhuan@main/install.sh; do (wget -qO install.sh "$u" || curl -fsSL -o install.sh "$u") 2>/dev/null && [ -s install.sh ] && head -1 install.sh | grep -q "^#!/bin/bash" && { ok=1; break; }; rm -f install.sh; done; [ -n "$ok" ] || { echo "下载 install.sh 失败，请检查网络"; exit 1; }; sudo bash install.sh 2>/dev/null || bash install.sh'
+sh -c 'set -e; if [ "$(id -u)" -eq 0 ]; then run=""; elif command -v sudo >/dev/null 2>&1; then run="sudo"; else echo "请用 root 运行，或先安装 sudo" >&2; exit 1; fi; if command -v apk >/dev/null 2>&1; then $run apk add --no-cache bash curl ca-certificates; elif command -v apt-get >/dev/null 2>&1; then $run apt-get update -qq; $run apt-get install -y bash curl ca-certificates; else echo "只支持 Debian、Ubuntu、Alpine" >&2; exit 1; fi; f=$(mktemp); trap '\''rm -f "$f"'\'' EXIT; curl -fsSL https://raw.githubusercontent.com/imthnio/vps-zhongzhuan/main/install.sh -o "$f" || curl -fsSL https://cdn.jsdelivr.net/gh/imthnio/vps-zhongzhuan@main/install.sh -o "$f"; [ -s "$f" ] && head -n 1 "$f" | grep -q "^#!/bin/bash" || { echo "下载的脚本不正确" >&2; exit 1; }; if [ -n "$run" ]; then sudo bash "$f"; else bash "$f"; fi'
 ```
 
-上面这一行会自动识别系统（Debian / Ubuntu / Alpine …），缺 bash、curl、wget 这些基础工具就自己装，下载时 GitHub 和 jsdelivr 两个源自动切换，全程不用你动手。
+上面这一行支持 Debian、Ubuntu、Alpine，会安装缺少的 bash、curl 和证书，并在 GitHub 下载失败时尝试 jsDelivr。需要 root 权限；普通用户需有 sudo。脚本运行中出错时会直接报错，不会重复运行。
 
 装好后，以后直接在终端输入 `zhuanfa` 就能打开管理菜单。
 
@@ -32,6 +32,8 @@ sh -c 'cd /tmp; for pm in "apk add --no-cache" "apt-get install -y" "yum install
 ```
 
 添加规则时是四步向导，每一步都有中文说明：填本机监听端口 → 填目标地址 → 填目标端口 → 写备注（可选），最后跟你确认一遍，还会顺手测一下目标通不通。
+
+脚本只会在删除规则或卸载时回收它自己新建并记录的防火墙放行。旧版本创建的规则没有归属记录，升级后请手动检查这些端口是否仍需放行。外部访问还需检查云安全组和 NAT 映射。
 
 ## 赞赏支持
 如果这个脚本帮到了你，欢迎请我喝杯咖啡 ☕  

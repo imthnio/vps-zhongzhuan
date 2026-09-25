@@ -32,8 +32,10 @@ BIN_PATH="/usr/local/bin/realm"    # realm 二进制文件装到哪里
 CONF_DIR="/etc/realm"              # 放配置的目录
 CONF_FILE="$CONF_DIR/config.json"  # realm 主配置文件（脚本自动生成，不用手改）
 RULES_FILE="$CONF_DIR/rules.list"  # 规则清单：纯文本，一行一条，格式见文件头注释
+FIREWALL_FILE="$CONF_DIR/firewall.list" # 只记录本脚本实际添加的防火墙规则
 SHORTCUT="/usr/local/bin/zhuanfa"  # 快捷命令：装好后终端输入 zhuanfa 直达菜单
-CURL_LOG="/tmp/zhuanfa-curl.log"   # 下载/装依赖出错时的日志，方便排查
+CURL_LOG="$(mktemp "${TMPDIR:-/tmp}/zhuanfa-curl.XXXXXX")" || exit 1
+trap 'rm -f "$CURL_LOG"' EXIT
 
 # 下载镜像前缀（按顺序挨个试）。
 # 有些 VPS 直连 GitHub 很慢甚至连不上，后面几个是加速镜像，
@@ -92,10 +94,10 @@ ask() {
     local prompt="$1" default="$2" var="$3"
     local input=""
     if [ -n "$default" ]; then
-        read -rp "$prompt [默认: $default]: " input
+        read -rp "$prompt [默认: $default]: " input || return 1
         [ -z "$input" ] && input="$default"
     else
-        read -rp "$prompt: " input
+        read -rp "$prompt: " input || return 1
     fi
     printf -v "$var" '%s' "$input"
 }
@@ -105,7 +107,7 @@ ask_yes() {
     local prompt="$1" default="${2:-n}"
     local hint="y/N" ans=""
     [ "$default" = "y" ] && hint="Y/n"
-    read -rp "$prompt [$hint]: " ans
+    read -rp "$prompt [$hint]: " ans || return 1
     [ -z "$ans" ] && ans="$default"
     [[ "$ans" =~ ^[Yy]$ ]]
 }
@@ -145,7 +147,7 @@ detect_os() {
         say_err "没找到 systemctl 也没找到 rc-service，不知道怎么管理服务"
         exit 1
     fi
-    say_info "检测到系统：包管理=$PKG_MGR，服务管理=$INIT_SYSTEM"
+    say_info "检测到系统：包管理=${PKG_MGR}，服务管理=${INIT_SYSTEM}"
 }
 
 install_deps() {
@@ -206,7 +208,7 @@ detect_arch() {
         armv7l|armv7)  echo "armv7-unknown-linux-musleabihf" ;;
         armv6l|armv6)  echo "arm-unknown-linux-musleabihf" ;;
         *)
-            say_err "你的 CPU 架构是 $m，realm 官方没提供这个架构的包，装不了"
+            say_err "你的 CPU 架构是 ${m}，realm 官方没提供这个架构的包，装不了"
             exit 1
             ;;
     esac
@@ -264,30 +266,35 @@ install_realm_bin() {
     say_step "安装 realm 二进制文件"
     # 已经装过且能跑 → 问一句要不要重装，避免手滑覆盖
     if [ -x "$BIN_PATH" ] && "$BIN_PATH" --help >/dev/null 2>&1; then
-        say_ok "检测到 realm 已经装过了（$BIN_PATH）"
+        say_ok "检测到 realm 已经装过了（${BIN_PATH}）"
         if ! ask_yes "是否重新下载安装（覆盖现有版本）" "n"; then
             say_info "保留现有版本，跳过下载"
             return 0
         fi
-        service_stop >/dev/null 2>&1 || true
     fi
-    local ver asset tmpdir
+    local ver asset tmpdir staged
     ver="$(get_realm_version)"
     asset="$(detect_arch)"
-    say_info "目标安装包：realm-$asset.tar.gz（版本 $ver）"
+    say_info "目标安装包：realm-${asset}.tar.gz（版本 ${ver}）"
     tmpdir="$(mktemp -d)"
-    # 不管中途成不成功，退出时都把临时目录清掉，不留垃圾
-    trap "rm -rf '$tmpdir'" EXIT
-    download_realm "$ver" "$asset" "$tmpdir/realm.tar.gz" || exit 1
+    download_realm "$ver" "$asset" "$tmpdir/realm.tar.gz" || { rm -rf "$tmpdir"; return 1; }
     say_info "正在解压安装…"
-    tar -xzf "$tmpdir/realm.tar.gz" -C "$tmpdir"
-    cp -f "$tmpdir/realm" "$BIN_PATH"
-    chmod +x "$BIN_PATH"
+    if ! tar -xzf "$tmpdir/realm.tar.gz" -C "$tmpdir" || ! "$tmpdir/realm" --help >/dev/null 2>&1; then
+        rm -rf "$tmpdir"
+        say_err "下载的 realm 无法运行，原版本未被覆盖"
+        return 1
+    fi
+    staged="$(mktemp "${BIN_PATH}.XXXXXX")" || { rm -rf "$tmpdir"; return 1; }
+    if ! cp "$tmpdir/realm" "$staged" || ! chmod +x "$staged" || ! mv -f "$staged" "$BIN_PATH"; then
+        rm -f "$staged"
+        rm -rf "$tmpdir"
+        say_err "安装 realm 文件失败，原版本未被覆盖"
+        return 1
+    fi
     rm -rf "$tmpdir"
-    trap - EXIT
     # 最终验货：二进制必须能跑起来（架构不对时这里会挂）
     if "$BIN_PATH" --help >/dev/null 2>&1; then
-        say_ok "realm 安装成功：$BIN_PATH（版本 $ver）"
+        say_ok "realm 安装成功：${BIN_PATH}（版本 ${ver}）"
     else
         say_err "文件装好了但运行失败，可能是 CPU 架构不匹配，请检查"
         exit 1
@@ -354,7 +361,7 @@ depend() {
 EOF
         chmod +x /etc/init.d/realm
     fi
-    service_enable
+    service_enable || { say_err "设置 realm 开机自启失败"; return 1; }
     say_ok "服务已配置，开机自动启动"
 }
 
@@ -403,76 +410,94 @@ gen_config() {
 
 # 查某个监听端口是否已经有规则了
 rule_exists() { [ -f "$RULES_FILE" ] && grep -q "^$1|" "$RULES_FILE"; }
+has_rules() { [ -f "$RULES_FILE" ] && grep -q '^[0-9][0-9]*|' "$RULES_FILE"; }
 
 # ==================== 防火墙放行 ====================
+record_firewall_rule() {
+    mkdir -p "$CONF_DIR"
+    local entry="$1|$2|$3"
+    if [ -f "$FIREWALL_FILE" ] && grep -qxF "$entry" "$FIREWALL_FILE"; then return 0; fi
+    printf '%s\n' "$entry" >> "$FIREWALL_FILE"
+}
+
 open_firewall() {
     # $1=端口。转发端口必须在防火墙放行，不然外面连不进来。
     # 按 ufw → firewalld → iptables 的顺序，能用哪个用哪个。
     # 注意：云厂商的安全组/防火墙在控制台里，脚本够不着，那个要自己去开。
-    local port="$1"
+    local port="$1" proto failed=0
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-        ufw allow "$port"/tcp >/dev/null 2>&1
-        ufw allow "$port"/udp >/dev/null 2>&1
-        say_ok "系统防火墙已放行 $port（ufw，TCP+UDP）"
-        return 0
+        for proto in tcp udp; do
+            if ! ufw status 2>/dev/null | awk -v rule="$port/$proto" '$1 == rule { found=1 } END { exit !found }'; then
+                if ufw allow "$port/$proto" >/dev/null 2>&1; then
+                    record_firewall_rule "$port" ufw "$proto" || { say_warn "无法记录 $port/$proto 的防火墙归属"; failed=1; }
+                else
+                    say_warn "ufw 放行 $port/$proto 失败，请检查防火墙"
+                    failed=1
+                fi
+            fi
+        done
+        if [ "$failed" -eq 0 ]; then say_ok "系统防火墙已放行 ${port}（ufw，TCP+UDP）"; fi
+        return "$failed"
     fi
     if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-        firewall-cmd --permanent --add-port="$port"/tcp >/dev/null 2>&1
-        firewall-cmd --permanent --add-port="$port"/udp >/dev/null 2>&1
-        firewall-cmd --reload >/dev/null 2>&1
-        say_ok "系统防火墙已放行 $port（firewalld，TCP+UDP）"
-        return 0
+        for proto in tcp udp; do
+            if ! firewall-cmd --permanent --query-port="$port/$proto" >/dev/null 2>&1; then
+                if firewall-cmd --permanent --add-port="$port/$proto" >/dev/null 2>&1; then
+                    record_firewall_rule "$port" firewalld "$proto" || { say_warn "无法记录 $port/$proto 的防火墙归属"; failed=1; }
+                else
+                    say_warn "firewalld 放行 $port/$proto 失败，请检查防火墙"
+                    failed=1
+                fi
+            fi
+        done
+        firewall-cmd --reload >/dev/null 2>&1 || failed=1
+        if [ "$failed" -eq 0 ]; then say_ok "系统防火墙已放行 ${port}（firewalld，TCP+UDP）"; fi
+        return "$failed"
     fi
     if command -v iptables >/dev/null 2>&1; then
-        # -C 先检查规则在不在，不在才加，避免重复添加一堆一样的
-        iptables -C INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1 || \
-            iptables -I INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1
-        iptables -C INPUT -p udp --dport "$port" -j ACCEPT >/dev/null 2>&1 || \
-            iptables -I INPUT -p udp --dport "$port" -j ACCEPT >/dev/null 2>&1
+        # 已有规则可能是管理员手工添加的，不登记为本脚本所有。
+        for proto in tcp udp; do
+            if ! iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT >/dev/null 2>&1; then
+                if iptables -I INPUT -p "$proto" --dport "$port" -j ACCEPT >/dev/null 2>&1; then
+                    record_firewall_rule "$port" iptables "$proto" || { say_warn "无法记录 $port/$proto 的防火墙归属"; failed=1; }
+                else
+                    say_warn "iptables 放行 $port/$proto 失败，请检查防火墙"
+                    failed=1
+                fi
+            fi
+        done
         save_firewall  # 规则存盘，重启后还在
-        say_ok "系统防火墙已放行 $port（iptables，TCP+UDP）"
-        return 0
+        if [ "$failed" -eq 0 ]; then say_ok "系统防火墙已放行 ${port}（iptables，TCP+UDP）"; fi
+        return "$failed"
     fi
     say_warn "没找到能用的防火墙工具，端口 $port 没自动放行；如果外面连不进来，先检查防火墙/安全组"
+    return 1
 }
 
 close_firewall() {
-    # 回收 open_firewall 放行的端口：删规则时调用，免得端口一直敞着。
-    # 后端选择跟 open_firewall 保持一致（ufw → firewalld → iptables），
-    # 只动"当初可能用过的"那个后端，不碰其他后端的规则——
-    # 以前是三个后端挨个删，万一用户在 iptables 里手写过一条一模一样的规则，
-    # 会被我们误删掉。
-    # 删不存在的规则会报错，全部重定向掉，不打扰用户。
-    local port="$1" proto backend=""
-    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-        backend="ufw"
-    elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-        backend="firewalld"
-    elif command -v iptables >/dev/null 2>&1; then
-        backend="iptables"
-    fi
-    case "$backend" in
-    ufw)
-        ufw --force delete allow "$port"/tcp >/dev/null 2>&1
-        ufw --force delete allow "$port"/udp >/dev/null 2>&1
-        ;;
-    firewalld)
-        firewall-cmd --permanent --remove-port="$port"/tcp >/dev/null 2>&1
-        firewall-cmd --permanent --remove-port="$port"/udp >/dev/null 2>&1
-        firewall-cmd --reload >/dev/null 2>&1
-        ;;
-    iptables)
-        # 循环删：万一之前重复加过几条，一次清干净
-        for proto in tcp udp; do
-            while iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT >/dev/null 2>&1; do
-                iptables -D INPUT -p "$proto" --dport "$port" -j ACCEPT >/dev/null 2>&1 || break
-            done
-        done
-        ;;
-    *)
-        say_warn "没找到能用的防火墙工具，端口 $port 的放行规则没自动回收；如果之前放行过，手动检查一下"
-        ;;
-    esac
+    # 只回收自己添加的规则，且使用当时记录的后端；旧安装没有登记的规则保留。
+    local port="$1" saved_port backend proto tmp
+    [ -f "$FIREWALL_FILE" ] || return 0
+    tmp="$(mktemp)" || return 1
+    while IFS='|' read -r saved_port backend proto; do
+        if [ "$saved_port" != "$port" ]; then
+            printf '%s|%s|%s\n' "$saved_port" "$backend" "$proto" >> "$tmp"
+            continue
+        fi
+        case "$backend" in
+            ufw) command -v ufw >/dev/null 2>&1 && ufw --force delete allow "$port/$proto" >/dev/null 2>&1 ;;
+            firewalld) command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --permanent --remove-port="$port/$proto" >/dev/null 2>&1 ;;
+            iptables) command -v iptables >/dev/null 2>&1 && iptables -D INPUT -p "$proto" --dport "$port" -j ACCEPT >/dev/null 2>&1 ;;
+            *) false ;;
+        esac
+        if [ "$?" -ne 0 ]; then
+            say_warn "未能回收 $backend 的 $port/$proto 放行规则，请手动检查"
+            printf '%s|%s|%s\n' "$saved_port" "$backend" "$proto" >> "$tmp"
+        elif [ "$backend" = firewalld ]; then
+            firewall-cmd --reload >/dev/null 2>&1 || true
+        fi
+    done < "$FIREWALL_FILE"
+    mv -f "$tmp" "$FIREWALL_FILE"
     return 0
 }
 
@@ -536,19 +561,55 @@ return 0
 # 重启服务让新配置生效，并确认端口真的在监听
 apply_and_verify() {
 local port="$1"
-gen_config
+gen_config || return 1
 say_info "正在重启 realm 服务使规则生效…"
 if ! service_restart; then
 say_err "服务重启失败！用菜单 6 看看状态，或检查配置文件：$CONF_FILE"
 return 1
 fi
-sleep 1
-if ss -tln 2>/dev/null | grep -q ":$port "; then
-say_ok "端口 $port 已在监听，规则生效！"
-return 0
+local attempt
+for attempt in 1 2 3; do
+    sleep 1
+    if service_is_active && ss -tln 2>/dev/null | grep -Eq ":$port[[:space:]]"; then
+        say_ok "端口 $port 已在监听，规则生效！"
+        return 0
+    fi
+done
+say_err "服务未运行或端口 $port 未监听，规则未生效"
+return 1
+}
+
+# 先保存原规则；新配置无法启动时，恢复原规则和配置。
+change_rules() {
+local action="$1" port="$2" addr="${3:-}" remote_port="${4:-}" note="${5:-}" backup
+ensure_rules_file
+backup="$(mktemp)" || return 1
+cp -p "$RULES_FILE" "$backup" || { rm -f "$backup"; return 1; }
+sed -i "/^$port|/d" "$RULES_FILE" || { cp -p "$backup" "$RULES_FILE"; rm -f "$backup"; return 1; }
+if [ "$action" = add ]; then
+    if ! printf '%s|%s|%s|%s\n' "$port" "$addr" "$remote_port" "$note" >> "$RULES_FILE"; then
+        cp -p "$backup" "$RULES_FILE"
+        rm -f "$backup"
+        return 1
+    fi
 fi
-say_warn "服务起来了，但暂时没看到端口 $port 在监听，等几秒再用菜单 6 检查"
-return 0
+if [ "$action" = add ]; then
+    apply_and_verify "$port" && { rm -f "$backup"; return 0; }
+else
+    if gen_config; then
+        if has_rules; then
+            service_restart && service_is_active && { rm -f "$backup"; return 0; }
+        else
+            service_stop && { rm -f "$backup"; return 0; }
+        fi
+    fi
+fi
+say_warn "应用新规则失败，正在恢复原规则"
+cp -p "$backup" "$RULES_FILE" || { say_err "恢复原规则文件失败：$RULES_FILE"; rm -f "$backup"; return 1; }
+rm -f "$backup"
+gen_config || { say_err "恢复原配置文件失败：$CONF_FILE"; return 1; }
+service_restart >/dev/null 2>&1 || say_err "原规则也未能重新启动，请检查服务状态"
+return 1
 }
 
 add_rule() {
@@ -575,12 +636,11 @@ echo ""
 while true; do
 say_info "本机监听端口：别人要连你这台机器的哪个端口？"
 say_info " 比如填 10000，别人访问「你这台机器的IP:10000」就会被转发走。"
-ask "请输入监听端口 (1-65535)" "" lport
+ask "请输入监听端口 (1-65535)" "" lport || return 1
 if ! is_port "$lport"; then say_err "端口不合法，请输入 1~65535 的数字"; continue; fi
 if rule_exists "$lport"; then
 say_warn "端口 $lport 已经有一条规则了"
 ask_yes "是否覆盖旧规则" "n" || { say_info "已取消"; return 1;}
-sed -i "/^$lport|/d" "$RULES_FILE"
 break
 fi
 # 端口被别的程序占了就提醒一声；被谁占了一目了然，自己判断
@@ -598,7 +658,7 @@ while true; do
 echo ""
 say_info "目标地址：要把流量转发到哪台服务器？"
 say_info " 填它的 IP 或域名，比如 8.8.8.8 或 example.com。"
-ask "请输入目标地址" "" raddr
+ask "请输入目标地址" "" raddr || return 1
 raddr="$(echo "$raddr" | tr -d ' ')" # 顺手去掉不小心带上的空格
 is_target_addr "$raddr" && break
 say_err "地址格式不对，IP 或域名都行，比如 1.2.3.4"
@@ -608,14 +668,18 @@ while true; do
 echo ""
 say_info "目标端口：目标服务器上的哪个端口？"
 say_info " 比如目标上跑的服务端口是 443 就填 443。"
-ask "请输入目标端口 (1-65535)" "" rport
+ask "请输入目标端口 (1-65535)" "" rport || return 1
 is_port "$rport" && break
 say_err "端口不合法，请输入 1~65535 的数字"
 done
 # 第 4 步：备注（可选）
 echo ""
 say_info "备注（可选）：给这条规则起个名，比如\"转发到香港落地机\"，直接回车跳过"
-ask "请输入备注" "" note
+ask "请输入备注" "" note || return 1
+if [[ "$note" == *'|'* || "$note" == *$'\n'* || "$note" == *$'\r'* ]]; then
+    say_err "备注不能包含竖线或换行"
+    return 1
+fi
 # 最后跟你确认一遍，免得手滑填错
 echo ""
 say_info "---------- 请确认 ----------"
@@ -638,16 +702,17 @@ is_port "$lport" || { say_err "LISTEN_PORT 不合法：$lport"; return 1;}
 is_target_addr "$raddr" || { say_err "TARGET_ADDR 不合法：$raddr"; return 1;}
 is_port "$rport" || { say_err "TARGET_PORT 不合法：$rport"; return 1;}
 fi
-# 写入规则清单（同端口旧规则先删掉，保证一个端口只对应一条）
-ensure_rules_file
-sed -i "/^$lport|/d" "$RULES_FILE" 2>/dev/null || true
-echo "$lport|$raddr|$rport|$note" >> "$RULES_FILE"
-open_firewall "$lport"
-apply_and_verify "$lport" || return 1
+if [[ "$note" == *'|'* || "$note" == *$'\n'* || "$note" == *$'\r'* ]]; then
+    say_err "备注不能包含竖线或换行"
+    return 1
+fi
+change_rules add "$lport" "$raddr" "$rport" "$note" || return 1
+open_firewall "$lport" || say_warn "转发已配置，但防火墙未完全放行 ${lport}，请检查系统防火墙"
 local pubip
 pubip="$(get_public_ip)"
 echo ""
-say_ok "完成！别人现在可以访问 ${pubip:-这台机器的IP}:$lport，流量会自动转到 $(fmt_remote "$raddr" "$rport")"
+say_ok "本机转发已启动：${pubip:-这台机器的IP}:${lport} → $(fmt_remote "$raddr" "$rport")"
+say_info "外部能否访问，还取决于云安全组、NAT 映射和目标服务器状态"
 }
 
 del_rule() {
@@ -658,7 +723,7 @@ if [ -z "$lport" ]; then
 list_rules || return 1
 echo ""
 local choice=""
-ask "请输入要删除的规则序号（按上面 [数字] 填）" "" choice
+ask "请输入要删除的规则序号（按上面 [数字] 填）" "" choice || return 1
 [[ "$choice" =~ ^[0-9]+$ ]] || { say_err "请输入数字序号"; return 1; }
 # 把序号换算成本机端口：第 N 条非空行 | 切出第一列
 lport="$(grep -v '^#' "$RULES_FILE" | grep -v '^$' | sed -n "${choice}p" | cut -d'|' -f1)"
@@ -666,9 +731,7 @@ lport="$(grep -v '^#' "$RULES_FILE" | grep -v '^$' | sed -n "${choice}p" | cut -
 ask_yes "确认删除本机端口 $lport 的规则" "n" || { say_info "已取消"; return 1;}
 fi
 rule_exists "$lport" || { say_err "端口 $lport 没有对应的规则"; return 1;}
-sed -i "/^$lport|/d" "$RULES_FILE"
-gen_config
-service_restart >/dev/null 2>&1 || true
+change_rules del "$lport" || return 1
 close_firewall "$lport"  # 回收这条规则放行的防火墙端口
 save_firewall
 say_ok "已删除端口 $lport 的规则"
@@ -680,17 +743,41 @@ say_step "开始安装 realm"
 need_root
 detect_os
 install_deps
-install_realm_bin
-write_service
-# 保证规则清单和配置文件存在。注意：已有规则不会被清空，放心重装。
-ensure_rules_file
-gen_config
-say_info "正在启动服务…"
-if service_restart && sleep 1 && service_is_active; then
-say_ok "realm 服务运行中，开机自启已设置"
-else
-say_warn "服务好像没起来，用菜单 6 看看状态"
+local old_bin="" staged=""
+if [ -x "$BIN_PATH" ]; then
+    old_bin="$(mktemp)" || return 1
+    cp -p "$BIN_PATH" "$old_bin" || { rm -f "$old_bin"; return 1; }
 fi
+write_service || { rm -f "$old_bin"; return 1; }
+install_realm_bin || { rm -f "$old_bin"; return 1; }
+# 保证规则清单和配置文件存在。注意：已有规则不会被清空，放心重装。
+ensure_rules_file || { rm -f "$old_bin"; return 1; }
+gen_config || { rm -f "$old_bin"; return 1; }
+if has_rules; then
+    say_info "正在启动服务…"
+    if service_restart && sleep 1 && service_is_active; then
+        say_ok "realm 服务运行中，开机自启已设置"
+    else
+        if [ -n "$old_bin" ]; then
+            staged="$(mktemp "${BIN_PATH}.XXXXXX")" || true
+            if [ -n "$staged" ] && cp -p "$old_bin" "$staged" && mv -f "$staged" "$BIN_PATH"; then
+                service_restart >/dev/null 2>&1 || say_err "旧版本也未能重新启动，请检查服务状态"
+                say_warn "已恢复原来的 realm 程序"
+            else
+                rm -f "$staged"
+                say_err "无法恢复原来的 realm 程序；备份保存在 $old_bin"
+                old_bin=""
+            fi
+        fi
+        rm -f "$old_bin"
+        say_err "服务未能启动，安装未完成；请用菜单 6 检查状态"
+        return 1
+    fi
+else
+    service_stop >/dev/null 2>&1 || true
+    say_info "还没有转发规则；添加第一条规则后会启动服务"
+fi
+rm -f "$old_bin"
 install_shortcut
 echo ""
 say_ok "安装完成！以后在终端输入 zhuanfa 就能打开管理菜单"
@@ -740,7 +827,7 @@ say_ok "卸载完成，干干净净"
 show_status() {
 echo ""
 say_info "========== 运行状态 =========="
-if [ -x "$BIN_PATH" ]; then echo " realm 程序：已安装（$BIN_PATH）"
+if [ -x "$BIN_PATH" ]; then echo " realm 程序：已安装（${BIN_PATH}）"
 else echo " realm 程序：未安装（先选菜单 1 安装）"; fi
 if service_is_active; then echo " 服务状态：运行中"
 else echo " 服务状态：未运行"; fi
@@ -773,7 +860,7 @@ echo " 7. 卸载（删除 realm 和所有规则）"
 echo " 0. 退出"
 echo "======================================"
 local c=""
-read -rp "请选择 [0-7]: " c
+read -rp "请选择 [0-7]: " c || { say_info "输入已结束，退出菜单"; return 0; }
 case "$c" in
 1) do_install;;
 2) add_rule;;
@@ -811,8 +898,10 @@ exit 1
 fi
 need_root; detect_os; install_deps
 show_menu;;
-*) say_err "未知参数：$action（可用：install / add / del / list / restart / status / uninstall）"; exit 1;;
+*) say_err "未知参数：${action}（可用：install / add / del / list / restart / status / uninstall）"; exit 1;;
 esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

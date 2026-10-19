@@ -897,8 +897,8 @@ ask_yes "确认添加这条规则" "y" || { say_info "已取消"; return 1;}
 # 毕竟对方可能只是暂时没开机
 if ! timeout 5 bash -c "echo >/dev/tcp/$raddr/$rport" 2>/dev/null; then
 say_warn "现在用 TCP 连 $(fmt_remote "$raddr" "$rport") 没连上：可能是地址/端口填错了，也可能是对方暂时没开机"
-say_info " 注意：Hysteria2、TUIC 这类节点只用 UDP，TCP 本来就连不上，这种情况选 y 继续就行"
-ask_yes "仍要添加吗" "$([ -n "$hop_range" ] && echo y || echo n)" || { say_info "已取消"; return 1;}
+say_info " 注意：Hysteria2、TUIC 这类节点只用 UDP，TCP 本来就连不上，这种情况直接回车继续就行"
+ask_yes "仍要添加吗（直接回车 = 添加）" "y" || { say_info "已取消"; return 1;}
 else
 say_ok "目标 $(fmt_remote "$raddr" "$rport") 现在能连通"
 fi

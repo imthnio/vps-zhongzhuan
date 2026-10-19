@@ -720,7 +720,7 @@ while IFS='|' read -r lport raddr rport note; do
 [ -z "${lport:-}" ] && continue
 case "$lport" in \#*) continue;; esac
 i=$((i + 1))
-printf "  [%d] 本机 :%s  →  %s" "$i" "$lport" "$(fmt_remote "$raddr" "$rport")"
+printf "  [%d] 中转端口 %s  →  落地机 %s" "$i" "$lport" "$(fmt_remote "$raddr" "$rport")"
 [ -n "${note:-}" ] && printf " （%s）" "$note"
 hop="$(get_hop "$lport")"
 [ -n "$hop" ] && printf "  [端口跳跃 UDP %s]" "$hop"
@@ -804,13 +804,42 @@ return 1
 fi
 echo ""
 say_info "========== 添加转发规则 =========="
-say_info "先理解一句话：转发 = 别人访问→ 自动转到"
+say_info "先看懂这张图，后面要填的东西都在图里："
 echo ""
-# 第 1 步：监听端口
+echo "   你的手机/电脑  ──→  这台中转机:【中转端口】  ──→  落地机IP:【节点端口】"
+echo ""
+say_info " 落地机 = 你的节点真正所在的那台服务器"
+say_info " 节点端口 = 节点本来的端口（落地机上的）"
+say_info " 中转端口 = 在这台中转机上开的端口，客户端以后连的就是它"
+# 第 1 步：落地机地址
 while true; do
-say_info "本机监听端口：别人要连你这台机器的哪个端口？"
-say_info " 比如填 10000，别人访问「你这台机器的IP:10000」就会被转发走。"
-ask "请输入监听端口 (1-65535)" "" lport || return 1
+echo ""
+say_info "【第 1 步】落地机地址：你的节点在哪台服务器上？"
+say_info " 就是你原来节点链接里 @ 后面、冒号前面的那段。"
+say_info " 比如节点链接是 hy2://密码@1.2.3.4:443 ，这里就填 1.2.3.4"
+ask "请输入落地机 IP 或域名" "" raddr || return 1
+raddr="$(echo "$raddr" | tr -d ' ')" # 顺手去掉不小心带上的空格
+is_target_addr "$raddr" && break
+say_err "地址格式不对，IP 或域名都行，比如 1.2.3.4"
+done
+# 第 2 步：节点端口（落地机上的端口）
+while true; do
+echo ""
+say_info "【第 2 步】节点端口：节点在落地机上用的是哪个端口？"
+say_info " 就是原来节点链接里 IP 后面冒号后的数字。"
+say_info " 比如 hy2://密码@1.2.3.4:443 ，这里就填 443"
+say_info " 落地机开了端口跳跃的，填它真正的端口：在落地机上运行 ss -ulnp | grep -i hy 看"
+ask "请输入节点端口 (1-65535)" "" rport || return 1
+is_port "$rport" && break
+say_err "端口不合法，请输入 1~65535 的数字"
+done
+# 第 3 步：中转端口（本机监听端口）
+while true; do
+echo ""
+say_info "【第 3 步】中转端口：在这台中转机上开哪个端口？"
+say_info " 以后客户端里的端口就改成这个。"
+say_info " 不知道填啥？直接回车，就用跟节点端口一样的数字（${rport}），最不容易搞混。"
+ask "请输入中转端口 (1-65535)" "$rport" lport || return 1
 if ! is_port "$lport"; then say_err "端口不合法，请输入 1~65535 的数字"; continue; fi
 port_in_other_hop "$lport" && continue
 if rule_exists "$lport"; then
@@ -828,28 +857,9 @@ ask_yes "仍要继续吗（可能转发不起来）" "n" || { say_info "已取�
 fi
 break
 done
-# 第 2 步：目标地址
-while true; do
-echo ""
-say_info "目标地址：要把流量转发到哪台服务器？"
-say_info " 填它的 IP 或域名，比如 8.8.8.8 或 example.com。"
-ask "请输入目标地址" "" raddr || return 1
-raddr="$(echo "$raddr" | tr -d ' ')" # 顺手去掉不小心带上的空格
-is_target_addr "$raddr" && break
-say_err "地址格式不对，IP 或域名都行，比如 1.2.3.4"
-done
-# 第 3 步：目标端口
-while true; do
-echo ""
-say_info "目标端口：目标服务器上的哪个端口？"
-say_info " 比如目标上跑的服务端口是 443 就填 443。"
-ask "请输入目标端口 (1-65535)" "" rport || return 1
-is_port "$rport" && break
-say_err "端口不合法，请输入 1~65535 的数字"
-done
 # 第 4 步：端口跳跃（可选）
 echo ""
-say_info "端口跳跃（可选）：只有目标是 Hysteria2 节点、并且你想用「端口跳跃」才需要开。"
+say_info "【第 4 步】端口跳跃（可选）：只有目标是 Hysteria2 节点、并且你想用「端口跳跃」才需要开。"
 say_info " 开了之后，客户端连本机一整段端口（比如 ${HOP_DEFAULT_RANGE}）都能用。"
 say_info " 不知道是啥？直接回车跳过就行，不影响正常转发。"
 local old_hop hop_busy
@@ -878,7 +888,7 @@ hop_range=""
 fi
 # 第 5 步：备注（可选）
 echo ""
-say_info "备注（可选）：给这条规则起个名，比如\"转发到香港落地机\"，直接回车跳过"
+say_info "【第 5 步】备注（可选）：给这条规则起个名，比如\"香港落地机\"，直接回车跳过"
 ask "请输入备注" "" note || return 1
 if [[ "$note" == *'|'* || "$note" == *$'\n'* || "$note" == *$'\r'* ]]; then
     say_err "备注不能包含竖线或换行"
@@ -887,11 +897,14 @@ fi
 # 最后跟你确认一遍，免得手滑填错
 echo ""
 say_info "---------- 请确认 ----------"
-echo " 本机监听： 0.0.0.0:$lport"
-echo " 转发目标： $(fmt_remote "$raddr" "$rport")"
-[ -n "$note" ] && echo " 备注： $note"
+echo "   你的手机/电脑  ──→  这台中转机:${lport}  ──→  $(fmt_remote "$raddr" "$rport")"
+echo ""
+echo " 中转端口（这台机器）： $lport"
+echo " 落地机地址：           $raddr"
+echo " 节点端口（落地机）：   $rport"
+[ -n "$note" ] && echo " 备注：                 $note"
+[ -n "$hop_range" ] && echo " 端口跳跃：             这台机器的 UDP $hop_range 都会转到中转端口 $lport"
 echo " （TCP 和 UDP 都会转）"
-[ -n "$hop_range" ] && echo " 端口跳跃： 本机 UDP $hop_range 全部 → 本机 $lport → 目标"
 ask_yes "确认添加这条规则" "y" || { say_info "已取消"; return 1;}
 # 目标连通性顺手测一下：连不上就提醒（多半是地址/端口填错了），但不强制拦你，
 # 毕竟对方可能只是暂时没开机
@@ -941,6 +954,15 @@ if [ -n "$hop_range" ] && [ "$hop_ok" -eq 0 ]; then
     echo " 不想跳跃也行：端口直接填 ${lport}"
     echo ""
     say_warn "记得去云服务器控制台的「安全组/防火墙」里放行 UDP ${hop_range}，脚本改不到那里"
+else
+    echo ""
+    say_info "---------- 客户端怎么改 ----------"
+    echo " 服务器地址：$raddr  改成  ${pubip:-这台机器的IP}"
+    if [ "$rport" = "$lport" ]; then echo " 端口：      ${lport}（不用改）"
+    else echo " 端口：      $rport  改成  ${lport}"; fi
+    echo " 密码、SNI（域名）、证书设置这些都照旧，不要改"
+    echo ""
+    say_warn "记得去云服务器控制台的「安全组/防火墙」里放行端口 ${lport}（TCP 和 UDP），脚本改不到那里"
 fi
 say_info "外部能否访问，还取决于云安全组、NAT 映射和目标服务器状态"
 }

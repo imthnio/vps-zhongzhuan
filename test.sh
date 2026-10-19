@@ -19,6 +19,8 @@ CONF_DIR="$tmp/realm"
 CONF_FILE="$CONF_DIR/config.json"
 RULES_FILE="$CONF_DIR/rules.list"
 FIREWALL_FILE="$CONF_DIR/firewall.list"
+HOP_FILE="$CONF_DIR/hop.list"
+HOP_SCRIPT="$CONF_DIR/hop.sh"
 BIN_PATH="$tmp/realm-bin"
 printf '#!/bin/sh\nexit 0\n' > "$BIN_PATH"
 chmod +x "$BIN_PATH"
@@ -29,12 +31,15 @@ original_close_firewall="$(declare -f close_firewall)"
 service_restart() { [ "$restart_ok" -eq 1 ]; }
 service_stop() { [ "$restart_ok" -eq 1 ]; }
 service_is_active() { [ "$restart_ok" -eq 1 ]; }
-ss() { printf 'LISTEN 0 128 0.0.0.0:10000 0.0.0.0:*\n'; }
+ss() { printf 'LISTEN 0 128 0.0.0.0:10000 0.0.0.0:*\nLISTEN 0 128 0.0.0.0:10001 0.0.0.0:*\n'; }
 sleep() { :; }
 get_public_ip() { :; }
 open_firewall() { :; }
 close_firewall() { :; }
 save_firewall() { :; }
+ensure_iptables() { :; }
+hop_runs=0
+run_hop_script() { hop_runs=$((hop_runs + 1)); }
 
 fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
 expect_rule() { grep -qxF "$1" "$RULES_FILE" || fail "expected rule: $1"; }
@@ -59,6 +64,32 @@ restart_ok=1
 NOTE='bad|entry'
 if add_rule >/dev/null 2>&1; then fail 'pipe in note accepted'; fi
 expect_rule '10000|1.2.3.4|443|first'
+
+NOTE=hy
+HOP_RANGE=20000-50000
+add_rule >/dev/null || fail 'add with port hopping'
+grep -qxF '10000|20000|50000' "$HOP_FILE" || fail 'hop range not recorded'
+grep -qF -- '--dport 20000:50000 -j REDIRECT --to-ports 10000' "$HOP_SCRIPT" || fail 'hop script missing redirect'
+[ "$hop_runs" -gt 0 ] || fail 'hop script not run'
+list_rules | grep -F '20000-50000' >/dev/null || fail 'hop range not listed'
+
+LISTEN_PORT=30000 HOP_RANGE=
+if add_rule >/dev/null 2>&1; then fail 'port inside another hop range accepted'; fi
+LISTEN_PORT=10001 HOP_RANGE=40000-60000
+if add_rule >/dev/null 2>&1; then fail 'overlapping hop range accepted'; fi
+HOP_RANGE=500-100
+if add_rule >/dev/null 2>&1; then fail 'reversed hop range accepted'; fi
+HOP_RANGE=60000:61000
+add_rule >/dev/null || fail 'second hop rule'
+grep -qxF '10001|60000|61000' "$HOP_FILE" || fail 'colon range not normalised'
+LISTEN_PORT=10001
+del_rule >/dev/null || fail 'delete hop rule'
+if grep -q '^10001|' "$HOP_FILE"; then fail 'hop range left after delete'; fi
+
+LISTEN_PORT=10000 HOP_RANGE=
+add_rule >/dev/null || fail 'overwrite without hopping'
+if grep -q '^10000|' "$HOP_FILE"; then fail 'old hop range kept after overwrite'; fi
+if grep -q REDIRECT "$HOP_SCRIPT"; then fail 'hop script still redirects'; fi
 
 NOTE=second
 add_rule >/dev/null || fail 'replacement add'
@@ -110,4 +141,4 @@ if do_install >/dev/null 2>&1; then fail 'failed upgrade reported success'; fi
 grep -q 'echo old' "$BIN_PATH" || fail 'previous realm binary not restored'
 [ "$restart_count" -eq 2 ] || fail 'previous realm service not restarted'
 
-printf 'PASS: rules, rollback, EOF, firewall ownership, upgrade recovery\n'
+printf 'PASS: rules, rollback, EOF, firewall ownership, upgrade recovery, port hopping\n'

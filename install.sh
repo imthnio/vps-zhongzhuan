@@ -10,6 +10,7 @@
 #   1. 自动下载安装 realm，并设成开机自启
 #   2. 添加转发规则：别人访问「这台机器:端口A」→ 自动转到「目标:端口B」
 #   3. 查看 / 删除规则，重启服务、看状态，一键卸载
+#   4. 端口跳跃（可选）：给 Hysteria2 节点做中转时，本机也能开端口跳跃
 #
 # 一键运行：复制 README 里的"一键运行"命令（会自动装缺的工具）。
 # 不要用 管道 | bash 的方式运行，否则进不了交互菜单。
@@ -33,6 +34,9 @@ CONF_DIR="/etc/realm"              # 放配置的目录
 CONF_FILE="$CONF_DIR/config.json"  # realm 主配置文件（脚本自动生成，不用手改）
 RULES_FILE="$CONF_DIR/rules.list"  # 规则清单：纯文本，一行一条，格式见文件头注释
 FIREWALL_FILE="$CONF_DIR/firewall.list" # 只记录本脚本实际添加的防火墙规则
+HOP_FILE="$CONF_DIR/hop.list"      # 端口跳跃清单：一行一条，格式：监听端口|起始端口|结束端口
+HOP_SCRIPT="$CONF_DIR/hop.sh"      # 根据 hop.list 生成的 iptables 脚本，realm 每次启动前都会先跑它
+HOP_DEFAULT_RANGE="20000-50000"    # 端口跳跃默认端口段
 SHORTCUT="/usr/local/bin/zhuanfa"  # 快捷命令：装好后终端输入 zhuanfa 直达菜单
 CURL_LOG="$(mktemp "${TMPDIR:-/tmp}/zhuanfa-curl.XXXXXX")" || exit 1
 trap 'rm -f "$CURL_LOG"' EXIT
@@ -342,6 +346,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# 端口跳跃的 iptables 规则：开机/重启时重新铺一遍；前面的 - 表示没开跳跃（文件不存在）也不影响启动
+ExecStartPre=-/bin/sh /etc/realm/hop.sh
 ExecStart=/usr/local/bin/realm -c /etc/realm/config.json
 Restart=on-failure
 RestartSec=5
@@ -364,6 +370,12 @@ pidfile="/run/realm.pid"
 depend() {
     need net
     after firewall
+}
+
+# 端口跳跃的 iptables 规则：开机/重启时重新铺一遍，没开跳跃就跳过
+start_pre() {
+    [ -f /etc/realm/hop.sh ] && sh /etc/realm/hop.sh
+    return 0
 }
 EOF
         chmod +x /etc/init.d/realm
@@ -536,6 +548,147 @@ get_public_ip() {
     curl -fsSL --connect-timeout 5 --max-time 8 https://ipinfo.io/ip 2>/dev/null | tr -d ' \n\r' || true
 }
 
+# ==================== 端口跳跃（给 Hysteria2 节点用） ====================
+# 原理：Hysteria2 的"端口跳跃"其实只有一个真实端口，是靠 iptables
+# 把一整段 UDP 端口都导到这个真实端口上。中转机也照这个思路：
+# realm 只监听一个端口，再用 iptables 把一段 UDP 端口全部导给它。
+# 客户端在这段端口里随便跳，最后都进同一条转发规则。
+
+# 端口段：20000-50000 或 20000:50000 都认，起始端口要小于结束端口
+# 用法：parse_port_range "输入" 起始变量名 结束变量名
+parse_port_range() {
+    # 局部变量故意起怪名字：要是跟调用处传进来的变量名重了，printf -v 就写不回去了
+    local _pr_s _pr_e
+    [[ "${1:-}" =~ ^([0-9]{1,5})[-:]([0-9]{1,5})$ ]] || return 1
+    _pr_s=$((10#${BASH_REMATCH[1]})); _pr_e=$((10#${BASH_REMATCH[2]}))  # 10#：去掉前导 0，防止被当成八进制
+    is_port "$_pr_s" && is_port "$_pr_e" && [ "$_pr_s" -lt "$_pr_e" ] || return 1
+    printf -v "$2" '%s' "$_pr_s"
+    printf -v "$3" '%s' "$_pr_e"
+}
+
+# 查某个监听端口开了哪段跳跃，输出 "起始-结束"，没开就什么都不输出
+get_hop() {
+    [ -f "$HOP_FILE" ] || return 0
+    awk -F'|' -v p="$1" '$1 == p { print $2 "-" $3; exit }' "$HOP_FILE"
+}
+
+# 端口段会不会跟别的规则打架？会就报错说明原因并返回 0
+# $1=这条规则自己的监听端口（自己不算冲突），$2/$3=起止端口
+hop_conflict() {
+    local own="$1" s="$2" e="$3" p a b
+    if [ -f "$RULES_FILE" ]; then
+        while IFS='|' read -r p _; do
+            case "$p" in ''|\#*) continue ;; esac
+            [ "$p" = "$own" ] && continue
+            if [ "$p" -ge "$s" ] && [ "$p" -le "$e" ]; then
+                say_err "端口段 $s-$e 里包含另一条规则的端口 ${p}，会抢走它的 UDP 流量，换个端口段吧"
+                return 0
+            fi
+        done < "$RULES_FILE"
+    fi
+    if [ -f "$HOP_FILE" ]; then
+        while IFS='|' read -r p a b; do
+            { [ -z "$p" ] || [ "$p" = "$own" ]; } && continue
+            if [ "$s" -le "$b" ] && [ "$a" -le "$e" ]; then
+                say_err "端口段 $s-$e 跟端口 $p 的跳跃端口段 $a-$b 重叠了，换个端口段吧"
+                return 0
+            fi
+        done < "$HOP_FILE"
+    fi
+    return 1
+}
+
+# 某个监听端口是不是落在了别的规则的跳跃端口段里？是就报错并返回 0
+port_in_other_hop() {
+    local port="$1" p a b
+    [ -f "$HOP_FILE" ] || return 1
+    while IFS='|' read -r p a b; do
+        { [ -z "$p" ] || [ "$p" = "$port" ]; } && continue
+        if [ "$port" -ge "$a" ] && [ "$port" -le "$b" ]; then
+            say_err "端口 $port 在端口 $p 的跳跃端口段 $a-$b 里面，UDP 会被导走，换个端口吧"
+            return 0
+        fi
+    done < "$HOP_FILE"
+    return 1
+}
+
+ensure_iptables() {
+    # 端口跳跃要靠 iptables；精简版 Debian 12/13、Alpine 可能没装，没有就装上
+    command -v iptables >/dev/null 2>&1 && return 0
+    say_info "端口跳跃需要 iptables，正在安装…"
+    if [ "$PKG_MGR" = "apt-get" ]; then
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -o DPkg::Lock::Timeout=120 iptables >"$CURL_LOG" 2>&1
+    elif [ "$PKG_MGR" = "apk" ]; then
+        apk add --no-cache iptables >"$CURL_LOG" 2>&1
+    fi
+    command -v iptables >/dev/null 2>&1 && return 0
+    say_err "iptables 安装失败，最后几行日志："
+    tail -n 5 "$CURL_LOG" 2>/dev/null | sed 's/^/  /'
+    return 1
+}
+
+write_hop_script() {
+    # 根据 hop.list 生成 hop.sh。规则全放在自己的 ZHUANFA_HOP 链里：
+    # 每次先整条链删干净再重建，跑多少遍都不会重复，也不碰别人的 iptables 规则。
+    mkdir -p "$CONF_DIR"
+    local p s e
+    {
+        echo '#!/bin/sh'
+        echo '# 由 zhuanfa 脚本根据 hop.list 自动生成，不用手改'
+        echo 'command -v iptables >/dev/null 2>&1 || exit 0'
+        echo 'while iptables -t nat -D PREROUTING -p udp -m addrtype --dst-type LOCAL -j ZHUANFA_HOP 2>/dev/null; do :; done'
+        echo 'iptables -t nat -F ZHUANFA_HOP 2>/dev/null'
+        echo 'iptables -t nat -X ZHUANFA_HOP 2>/dev/null'
+        if [ -f "$HOP_FILE" ] && grep -q '^[0-9]' "$HOP_FILE"; then
+            echo 'ok=0'
+            echo 'iptables -t nat -N ZHUANFA_HOP || ok=1'
+            while IFS='|' read -r p s e; do
+                [ -z "$p" ] && continue
+                echo "iptables -t nat -A ZHUANFA_HOP -p udp --dport $s:$e -j REDIRECT --to-ports $p || ok=1"
+            done < "$HOP_FILE"
+            # 只接管发给本机的包，免得误伤本机上 Docker 之类转出去的流量
+            echo 'iptables -t nat -I PREROUTING 1 -p udp -m addrtype --dst-type LOCAL -j ZHUANFA_HOP || ok=1'
+            echo 'exit $ok'
+        fi
+    } > "$HOP_SCRIPT"
+    chmod +x "$HOP_SCRIPT"
+}
+
+run_hop_script() { sh "$HOP_SCRIPT" >/dev/null 2>&1; }
+
+ensure_hop_hook() {
+    # 老版本脚本装的服务文件里没有"启动前先跑 hop.sh"这一步，
+    # 不补上的话重启机器后端口跳跃就没了。这里检测一下，缺了就重写服务文件。
+    local f="/etc/systemd/system/realm.service"
+    [ "$INIT_SYSTEM" = "openrc" ] && f="/etc/init.d/realm"
+    [ -n "$INIT_SYSTEM" ] || return 0
+    grep -q 'hop.sh' "$f" 2>/dev/null && return 0
+    write_service >/dev/null
+}
+
+# 设置 / 关闭某个监听端口的端口跳跃：set_hop 端口 "起始-结束"（第二个参数留空 = 关闭）
+set_hop() {
+    local port="$1" range="${2:-}" s="" e="" tmp
+    if [ -n "$range" ]; then
+        parse_port_range "$range" s e || { say_err "端口段不合法：$range"; return 1; }
+        ensure_iptables || return 1
+    else
+        [ -n "$(get_hop "$port")" ] || return 0  # 本来就没开，啥也不用做
+    fi
+    mkdir -p "$CONF_DIR"
+    tmp="$(mktemp)" || return 1
+    [ -f "$HOP_FILE" ] && awk -F'|' -v p="$port" '$1 != p' "$HOP_FILE" > "$tmp"
+    [ -n "$range" ] && printf '%s|%s|%s\n' "$port" "$s" "$e" >> "$tmp"
+    mv -f "$tmp" "$HOP_FILE" || { rm -f "$tmp"; return 1; }
+    write_hop_script || return 1
+    if ! run_hop_script; then
+        say_err "端口跳跃的 iptables 规则没加上，可以手动跑一下看报错：sh $HOP_SCRIPT"
+        return 1
+    fi
+    [ -n "$range" ] && ensure_hop_hook
+    return 0
+}
+
 # ==================== 规则管理 ====================
 need_installed() {
 # 加/删规则前先确认 realm 装好了，没装就指条明路
@@ -552,13 +705,15 @@ if [ ! -f "$RULES_FILE" ] || [ -z "$(grep -v '^#' "$RULES_FILE" 2>/dev/null | gr
 say_info "还没有任何规则，选菜单 2 添加第一条吧"
 return 1
 fi
-local i=0 lport raddr rport note
+local i=0 lport raddr rport note hop
 while IFS='|' read -r lport raddr rport note; do
 [ -z "${lport:-}" ] && continue
 case "$lport" in \#*) continue;; esac
 i=$((i + 1))
 printf "  [%d] 本机 :%s  →  %s" "$i" "$lport" "$(fmt_remote "$raddr" "$rport")"
 [ -n "${note:-}" ] && printf " （%s）" "$note"
+hop="$(get_hop "$lport")"
+[ -n "$hop" ] && printf "  [端口跳跃 UDP %s]" "$hop"
 echo ""
 done < "$RULES_FILE"
 say_info "共 $i 条规则（TCP 和 UDP 都转）"
@@ -625,7 +780,9 @@ need_installed || return 1
 # 交互：直接调 add_rule，跟着向导一步步填（菜单 2 就是这么进来的）
 # 非交互：环境变量传参，适合老手写脚本调用：
 # LISTEN_PORT=10000 TARGET_ADDR=1.2.3.4 TARGET_PORT=443 NOTE="备注" bash install.sh add
+# 要端口跳跃再加 HOP_RANGE=20000-50000（不加 = 这条规则不开跳跃）
 local lport="${LISTEN_PORT:-}" raddr="${TARGET_ADDR:-}" rport="${TARGET_PORT:-}" note="${NOTE:-}"
+local hop_range="${HOP_RANGE:-}" hop_s="" hop_e=""
 if [ -z "$lport$raddr$rport" ]; then
 # ---------------- 交互式向导 ----------------
 # 非交互终端（stdin 不是键盘，比如被重定向/管道占了）下 read 会直接读到 EOF，
@@ -645,6 +802,7 @@ say_info "本机监听端口：别人要连你这台机器的哪个端口？"
 say_info " 比如填 10000，别人访问「你这台机器的IP:10000」就会被转发走。"
 ask "请输入监听端口 (1-65535)" "" lport || return 1
 if ! is_port "$lport"; then say_err "端口不合法，请输入 1~65535 的数字"; continue; fi
+port_in_other_hop "$lport" && continue
 if rule_exists "$lport"; then
 say_warn "端口 $lport 已经有一条规则了"
 ask_yes "是否覆盖旧规则" "n" || { say_info "已取消"; return 1;}
@@ -679,7 +837,30 @@ ask "请输入目标端口 (1-65535)" "" rport || return 1
 is_port "$rport" && break
 say_err "端口不合法，请输入 1~65535 的数字"
 done
-# 第 4 步：备注（可选）
+# 第 4 步：端口跳跃（可选）
+echo ""
+say_info "端口跳跃（可选）：只有目标是 Hysteria2 节点、并且你想用「端口跳跃」才需要开。"
+say_info " 开了之后，客户端连本机一整段端口（比如 ${HOP_DEFAULT_RANGE}）都能用。"
+say_info " 不知道是啥？直接回车跳过就行，不影响正常转发。"
+local old_hop
+old_hop="$(get_hop "$lport")"
+if ask_yes "要开启端口跳跃吗" "$([ -n "$old_hop" ] && echo y || echo n)"; then
+while true; do
+say_info " 填一段端口，格式：起始端口-结束端口。不懂就直接回车用默认的。"
+ask "请输入跳跃端口段" "${old_hop:-$HOP_DEFAULT_RANGE}" hop_range || return 1
+hop_range="$(echo "$hop_range" | tr -d ' ')"
+if ! parse_port_range "$hop_range" hop_s hop_e; then
+say_err "格式不对，要写成 20000-50000 这样，前面的数字要比后面小"
+continue
+fi
+hop_conflict "$lport" "$hop_s" "$hop_e" && continue
+hop_range="$hop_s-$hop_e"
+break
+done
+else
+hop_range=""
+fi
+# 第 5 步：备注（可选）
 echo ""
 say_info "备注（可选）：给这条规则起个名，比如\"转发到香港落地机\"，直接回车跳过"
 ask "请输入备注" "" note || return 1
@@ -694,12 +875,14 @@ echo " 本机监听： 0.0.0.0:$lport"
 echo " 转发目标： $(fmt_remote "$raddr" "$rport")"
 [ -n "$note" ] && echo " 备注： $note"
 echo " （TCP 和 UDP 都会转）"
+[ -n "$hop_range" ] && echo " 端口跳跃： 本机 UDP $hop_range 全部 → 本机 $lport → 目标"
 ask_yes "确认添加这条规则" "y" || { say_info "已取消"; return 1;}
 # 目标连通性顺手测一下：连不上就提醒（多半是地址/端口填错了），但不强制拦你，
 # 毕竟对方可能只是暂时没开机
 if ! timeout 5 bash -c "echo >/dev/tcp/$raddr/$rport" 2>/dev/null; then
-say_warn "现在连 $(fmt_remote "$raddr" "$rport") 没连上：可能是地址/端口填错了，也可能是对方暂时没开机"
-ask_yes "仍要添加吗" "n" || { say_info "已取消"; return 1;}
+say_warn "现在用 TCP 连 $(fmt_remote "$raddr" "$rport") 没连上：可能是地址/端口填错了，也可能是对方暂时没开机"
+say_info " 注意：Hysteria2、TUIC 这类节点只用 UDP，TCP 本来就连不上，这种情况选 y 继续就行"
+ask_yes "仍要添加吗" "$([ -n "$hop_range" ] && echo y || echo n)" || { say_info "已取消"; return 1;}
 else
 say_ok "目标 $(fmt_remote "$raddr" "$rport") 现在能连通"
 fi
@@ -708,17 +891,40 @@ else
 is_port "$lport" || { say_err "LISTEN_PORT 不合法：$lport"; return 1;}
 is_target_addr "$raddr" || { say_err "TARGET_ADDR 不合法：$raddr"; return 1;}
 is_port "$rport" || { say_err "TARGET_PORT 不合法：$rport"; return 1;}
+if [ -n "$hop_range" ]; then
+    parse_port_range "$hop_range" hop_s hop_e || { say_err "HOP_RANGE 不合法：${hop_range}（要写成 20000-50000）"; return 1; }
+    hop_conflict "$lport" "$hop_s" "$hop_e" && return 1
+    hop_range="$hop_s-$hop_e"
+fi
 fi
 if [[ "$note" == *'|'* || "$note" == *$'\n'* || "$note" == *$'\r'* ]]; then
     say_err "备注不能包含竖线或换行"
     return 1
 fi
+port_in_other_hop "$lport" && return 1
 change_rules add "$lport" "$raddr" "$rport" "$note" || return 1
 open_firewall "$lport" || say_warn "转发已配置，但防火墙未完全放行 ${lport}，请检查系统防火墙"
-local pubip
+local pubip hop_ok=0
 pubip="$(get_public_ip)"
+# 覆盖旧规则时 hop_range 为空，set_hop 会顺手把旧的跳跃关掉
+if ! set_hop "$lport" "$hop_range"; then
+    hop_ok=1
+    say_warn "端口跳跃没开成功，但单端口转发是好的，客户端先填单个端口 ${lport} 用着"
+fi
 echo ""
 say_ok "本机转发已启动：${pubip:-这台机器的IP}:${lport} → $(fmt_remote "$raddr" "$rport")"
+if [ -n "$hop_range" ] && [ "$hop_ok" -eq 0 ]; then
+    say_ok "端口跳跃已开启：本机 UDP ${hop_range} 都会转到这条规则"
+    echo ""
+    say_info "---------- 客户端怎么改 ----------"
+    echo " 原来节点里的服务器地址换成本机的，端口换成端口段："
+    echo "   hy2:// 链接 / Hysteria2 官方客户端：服务器写 ${pubip:-这台机器的IP}:${hop_range}"
+    echo "   Clash Meta（mihomo）：server 写 ${pubip:-这台机器的IP}，port 写 ${lport}，再加一行 ports: ${hop_range}"
+    echo " 密码、SNI（域名）、证书设置这些都照旧，不要改"
+    echo " 不想跳跃也行：端口直接填 ${lport}"
+    echo ""
+    say_warn "记得去云服务器控制台的「安全组/防火墙」里放行 UDP ${hop_range}，脚本改不到那里"
+fi
 say_info "外部能否访问，还取决于云安全组、NAT 映射和目标服务器状态"
 }
 
@@ -739,6 +945,7 @@ ask_yes "确认删除本机端口 $lport 的规则" "n" || { say_info "已取消
 fi
 rule_exists "$lport" || { say_err "端口 $lport 没有对应的规则"; return 1;}
 change_rules del "$lport" || return 1
+set_hop "$lport" "" || say_warn "端口 $lport 的跳跃规则没删干净，可以手动跑：sh $HOP_SCRIPT"
 close_firewall "$lport"  # 回收这条规则放行的防火墙端口
 save_firewall
 say_ok "已删除端口 $lport 的规则"
@@ -825,6 +1032,11 @@ rm -f /etc/systemd/system/realm.service
 systemctl daemon-reload >/dev/null 2>&1 || true
 fi
 for p in $ports; do close_firewall "$p"; done  # 回收所有规则放行的端口
+# 端口跳跃：清空清单再生成一遍 hop.sh，跑一下就把 ZHUANFA_HOP 链整条删掉了
+if [ -f "$HOP_SCRIPT" ]; then
+    rm -f "$HOP_FILE"
+    write_hop_script && run_hop_script
+fi
 save_firewall
 rm -f "$BIN_PATH" "$SHORTCUT"
 rm -rf "$CONF_DIR"
@@ -858,7 +1070,7 @@ if service_is_active; then echo " realm 状态：运行中"
 else echo " realm 状态：未运行"; fi
 echo ""
 echo " 1. 安装 / 更新 realm（第一次用先选这个）"
-echo " 2. 添加转发规则"
+echo " 2. 添加转发规则（支持 Hysteria2 端口跳跃）"
 echo " 3. 查看转发规则"
 echo " 4. 删除转发规则"
 echo " 5. 重启 realm 服务"

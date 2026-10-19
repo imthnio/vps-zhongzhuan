@@ -612,6 +612,13 @@ port_in_other_hop() {
     return 1
 }
 
+# 端口段里有没有别的程序在用 UDP？有就逐行打出来（realm 自己的不算）
+hop_udp_busy() {
+    ss -ulnpH 2>/dev/null | awk -v s="$1" -v e="$2" '
+        /"realm"/ { next }
+        { n = split($4, a, ":"); p = a[n] + 0; if (p >= s && p <= e) print "  " $4 "  " $NF }'
+}
+
 ensure_iptables() {
     # 端口跳跃要靠 iptables；精简版 Debian 12/13、Alpine 可能没装，没有就装上
     command -v iptables >/dev/null 2>&1 && return 0
@@ -672,8 +679,11 @@ set_hop() {
     if [ -n "$range" ]; then
         parse_port_range "$range" s e || { say_err "端口段不合法：$range"; return 1; }
         ensure_iptables || return 1
-    else
-        [ -n "$(get_hop "$port")" ] || return 0  # 本来就没开，啥也不用做
+    elif [ -z "$(get_hop "$port")" ]; then
+        # 这条本来就没开跳跃。但前面 firewall-cmd --reload 之类的操作可能把
+        # nat 表冲掉了，别的规则的跳跃也跟着没了，所以顺手重铺一遍
+        if [ -f "$HOP_SCRIPT" ]; then run_hop_script || say_warn "端口跳跃规则重铺失败，可以手动跑：sh $HOP_SCRIPT"; fi
+        return 0
     fi
     mkdir -p "$CONF_DIR"
     tmp="$(mktemp)" || return 1
@@ -842,7 +852,7 @@ echo ""
 say_info "端口跳跃（可选）：只有目标是 Hysteria2 节点、并且你想用「端口跳跃」才需要开。"
 say_info " 开了之后，客户端连本机一整段端口（比如 ${HOP_DEFAULT_RANGE}）都能用。"
 say_info " 不知道是啥？直接回车跳过就行，不影响正常转发。"
-local old_hop
+local old_hop hop_busy
 old_hop="$(get_hop "$lport")"
 if ask_yes "要开启端口跳跃吗" "$([ -n "$old_hop" ] && echo y || echo n)"; then
 while true; do
@@ -854,6 +864,12 @@ say_err "格式不对，要写成 20000-50000 这样，前面的数字要比后�
 continue
 fi
 hop_conflict "$lport" "$hop_s" "$hop_e" && continue
+hop_busy="$(hop_udp_busy "$hop_s" "$hop_e")"
+if [ -n "$hop_busy" ]; then
+say_warn "这段端口里已经有别的程序在用 UDP，开了跳跃它们就收不到 UDP 了："
+echo "$hop_busy" | head -n 5
+ask_yes "仍要用这个端口段吗（选 n 重新填一段）" "n" || continue
+fi
 hop_range="$hop_s-$hop_e"
 break
 done
@@ -894,6 +910,7 @@ is_port "$rport" || { say_err "TARGET_PORT 不合法：$rport"; return 1;}
 if [ -n "$hop_range" ]; then
     parse_port_range "$hop_range" hop_s hop_e || { say_err "HOP_RANGE 不合法：${hop_range}（要写成 20000-50000）"; return 1; }
     hop_conflict "$lport" "$hop_s" "$hop_e" && return 1
+    [ -n "$(hop_udp_busy "$hop_s" "$hop_e")" ] && say_warn "端口段 $hop_s-$hop_e 里已有别的程序在用 UDP，开跳跃后它们会收不到 UDP"
     hop_range="$hop_s-$hop_e"
 fi
 fi
@@ -945,8 +962,9 @@ ask_yes "确认删除本机端口 $lport 的规则" "n" || { say_info "已取消
 fi
 rule_exists "$lport" || { say_err "端口 $lport 没有对应的规则"; return 1;}
 change_rules del "$lport" || return 1
-set_hop "$lport" "" || say_warn "端口 $lport 的跳跃规则没删干净，可以手动跑：sh $HOP_SCRIPT"
 close_firewall "$lport"  # 回收这条规则放行的防火墙端口
+# 放在防火墙操作之后：firewall-cmd --reload 可能冲掉 nat 表，这里删完顺便把剩下的跳跃重铺
+set_hop "$lport" "" || say_warn "端口 $lport 的跳跃规则没删干净，可以手动跑：sh $HOP_SCRIPT"
 save_firewall
 say_ok "已删除端口 $lport 的规则"
 }
@@ -1116,6 +1134,8 @@ say_info '不要用 管道 | bash 的方式运行，请复制 README 里的"一�
 exit 1
 fi
 need_root; detect_os; install_deps
+# 用一键命令跑了新版脚本，但 zhuanfa 还是老版本？顺手更新，免得下次用 zhuanfa 又回到老功能
+if [ -f "$SHORTCUT" ] && [ -f "$0" ] && ! cmp -s "$0" "$SHORTCUT"; then install_shortcut; fi
 show_menu;;
 *) say_err "未知参数：${action}（可用：install / add / del / list / restart / status / uninstall）"; exit 1;;
 esac

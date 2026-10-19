@@ -85,6 +85,12 @@ grep -qxF '10001|60000|61000' "$HOP_FILE" || fail 'colon range not normalised'
 LISTEN_PORT=10001
 del_rule >/dev/null || fail 'delete hop rule'
 if grep -q '^10001|' "$HOP_FILE"; then fail 'hop range left after delete'; fi
+HOP_RANGE=
+runs_before="$hop_runs"
+add_rule >/dev/null || fail 'plain add next to hop rule'
+[ "$hop_runs" -gt "$runs_before" ] || fail 'other hop rules not reapplied after plain add'
+grep -qxF '10000|20000|50000' "$HOP_FILE" || fail 'plain add touched other hop range'
+del_rule >/dev/null || fail 'delete plain rule'
 
 LISTEN_PORT=10000 HOP_RANGE=
 add_rule >/dev/null || fail 'overwrite without hopping'

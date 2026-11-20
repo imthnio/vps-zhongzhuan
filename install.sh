@@ -26,18 +26,20 @@
 set -u
 
 # ==================== 全局配置（一般不用改） ====================
-REALM_PIN_VERSION="v2.9.6"          # 脚本内置的 realm 版本号
-                                   # 安装时会先联网查官方最新版，查不到就用这个保底
-UPSTREAM_REPO="zhboner/realm"      # realm 官方 GitHub 仓库
-BIN_PATH="/usr/local/bin/realm"    # realm 二进制文件装到哪里
-CONF_DIR="/etc/realm"              # 放配置的目录
-CONF_FILE="$CONF_DIR/config.json"  # realm 主配置文件（脚本自动生成，不用手改）
-RULES_FILE="$CONF_DIR/rules.list"  # 规则清单：纯文本，一行一条，格式见文件头注释
+REALM_PIN_VERSION="v2.9.6"              # 脚本内置的 realm 版本号
+                                        # 安装时会先联网查官方最新版，查不到就用这个保底
+UPSTREAM_REPO="zhboner/realm"           # realm 官方 GitHub 仓库
+BIN_PATH="/usr/local/bin/realm"         # realm 二进制文件装到哪里
+CONF_DIR="/etc/realm"                   # 放配置的目录
+CONF_FILE="$CONF_DIR/config.json"       # realm 主配置文件（脚本自动生成，不用手改）
+RULES_FILE="$CONF_DIR/rules.list"       # 规则清单：纯文本，一行一条，格式见文件头注释
 FIREWALL_FILE="$CONF_DIR/firewall.list" # 只记录本脚本实际添加的防火墙规则
-HOP_FILE="$CONF_DIR/hop.list"      # 端口跳跃清单：一行一条，格式：监听端口|起始端口|结束端口
-HOP_SCRIPT="$CONF_DIR/hop.sh"      # 根据 hop.list 生成的 iptables 脚本，realm 每次启动前都会先跑它
-HOP_DEFAULT_RANGE="20000-50000"    # 端口跳跃默认端口段
-SHORTCUT="/usr/local/bin/zhuanfa"  # 快捷命令：装好后终端输入 zhuanfa 直达菜单
+HOP_FILE="$CONF_DIR/hop.list"           # 端口跳跃清单：一行一条，格式：监听端口|起始端口|结束端口
+HOP_SCRIPT="$CONF_DIR/hop.sh"           # 根据 hop.list 生成的 iptables 脚本，realm 每次启动前都会先跑它
+HOP_DEFAULT_RANGE="20000-50000"         # 端口跳跃默认端口段
+SHORTCUT="/usr/local/bin/zhuanfa"       # 快捷命令：装好后终端输入 zhuanfa 直达菜单
+SYSTEMD_UNIT="/etc/systemd/system/realm.service"
+OPENRC_INIT="/etc/init.d/realm"
 CURL_LOG="$(mktemp "${TMPDIR:-/tmp}/zhuanfa-curl.XXXXXX")" || exit 1
 trap 'rm -f "$CURL_LOG"' EXIT
 
@@ -59,58 +61,153 @@ INIT_SYSTEM=""  # 服务管理：systemd 或 openrc
 # 为了让重要信息一眼能看到：绿色=成功，黄色=提醒，红色=出错，蓝色=说明
 C_RED='\033[0;31m'; C_GREEN='\033[0;32m'; C_YELLOW='\033[1;33m'; C_BLUE='\033[0;34m'; C_NC='\033[0m'
 
-say_ok()   { echo -e "${C_GREEN}✓ $*${C_NC}"; }
-say_info() { echo -e "${C_BLUE}$*${C_NC}"; }
-say_warn() { echo -e "${C_YELLOW}⚠ $*${C_NC}"; }
-say_err()  { echo -e "${C_RED}✗ $*${C_NC}" >&2; }
-say_step() { echo -e "\n${C_YELLOW}>>> $*${C_NC}"; }
+say_ok()   { printf '%b✓ %s%b\n' "$C_GREEN" "$*" "$C_NC"; }
+say_info() { printf '%b%s%b\n' "$C_BLUE" "$*" "$C_NC"; }
+say_warn() { printf '%b⚠ %s%b\n' "$C_YELLOW" "$*" "$C_NC"; }
+say_err()  { printf '%b✗ %s%b\n' "$C_RED" "$*" "$C_NC" >&2; }
+say_step() { printf '\n%b>>> %s%b\n' "$C_YELLOW" "$*" "$C_NC"; }
 
 # ==================== 输入校验小工具 ====================
-# 端口：1~65535 的纯数字
-is_port() { [[ "${1:-}" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
-
-# IPv4：四段数字，每段 0~255
-is_ipv4() {
-    local ip="$1"
-    [[ "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || return 1
-    local n
-    IFS='.' read -ra _p <<< "$ip"
-    for n in "${_p[@]}"; do [ "$n" -le 255 ] || return 1; done
+# 端口：1~65535，不接受前导 0（避免 0443 导致规则与 ss 监听检查不一致）
+is_port() {
+    [[ "${1:-}" =~ ^[1-9][0-9]{0,4}$ ]] && [ "$1" -le 65535 ]
 }
 
-# 目标地址：IPv4、IPv6（含冒号就行，不细抠）或域名都算合法
-is_target_addr() {
-    local a="$1"
-    # 纯数字加点（长得像 IPv4）：必须是合法 IPv4，不合法就直接判错，
-    # 不能蒙混成"域名"过关，不然 999.1.1.1 这种也会被放行
-    if [[ "$a" =~ ^[0-9.]+$ ]]; then
-        is_ipv4 "$a"
+# IPv4：四段数字，每段 0~255，不接受前导 0（避免八进制歧义）
+is_ipv4() {
+    local ip="${1:-}"
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    local IFS='.'
+    local -a parts
+    read -ra parts <<< "$ip"
+    [ "${#parts[@]}" -eq 4 ] || return 1
+    local n
+    for n in "${parts[@]}"; do
+        [[ "$n" =~ ^(0|[1-9][0-9]{0,2})$ ]] || return 1
+        [ "$n" -le 255 ] || return 1
+    done
+    return 0
+}
+
+# IPv6：严格校验标准格式与压缩格式（含 ::ffff:1.2.3.4），排除 cafe:443、1::2::3、::: 等非法输入
+is_ipv6() {
+    local ip="${1:-}"
+    [[ "$ip" == *":"* ]] || return 1
+    [[ "$ip" =~ ^[0-9a-fA-F:.]+$ ]] || return 1
+    [[ "$ip" == *":::"* ]] && return 1
+    if [[ "$ip" == :* ]] && [[ "$ip" != ::* ]]; then return 1; fi
+    if [[ "$ip" == *: ]] && [[ "$ip" != *:: ]]; then return 1; fi
+
+    if [[ "$ip" == *.* ]]; then
+        local prefix="${ip%:*}"
+        local suffix="${ip##*:}"
+        is_ipv4 "$suffix" || return 1
+        [[ "$prefix" == *.* ]] && return 1
+        ip="${prefix}:0:0"
+    fi
+
+    local left="" right="" has_dd=0
+    if [[ "$ip" == *"::"* ]]; then
+        has_dd=1
+        left="${ip%%::*}"
+        right="${ip#*::}"
+        [[ "$right" == *"::"* ]] && return 1
+    else
+        left="$ip"
+    fi
+
+    local count=0 seg
+    local -a segs
+    if [ -n "$left" ]; then
+        IFS=':' read -ra segs <<< "$left"
+        for seg in "${segs[@]}"; do
+            [[ "$seg" =~ ^[0-9a-fA-F]{1,4}$ ]] || return 1
+            count=$((count + 1))
+        done
+    fi
+    if [ -n "$right" ]; then
+        IFS=':' read -ra segs <<< "$right"
+        for seg in "${segs[@]}"; do
+            [[ "$seg" =~ ^[0-9a-fA-F]{1,4}$ ]] || return 1
+            count=$((count + 1))
+        done
+    fi
+
+    if [ "$has_dd" -eq 1 ]; then
+        [ "$count" -le 7 ] || return 1
+    else
+        [ "$count" -eq 8 ] || return 1
+    fi
+    return 0
+}
+
+# 域名：允许 163.com、1.hk.example.com、localhost 等合法主机名；
+# 拒绝 1.2.3.g、a..b、-bad.com、foo.123 等非法域名
+is_domain() {
+    local d="${1:-}"
+    [ -n "$d" ] && [ "${#d}" -le 253 ] || return 1
+    if [[ "$d" != *.* ]]; then
+        [[ "$d" =~ ^[a-zA-Z]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]]
         return $?
     fi
-    # IPv6：必须包含冒号，至少有一个冒号，不能只是冒号；全是16进制数字/冒号
-    if [[ "$a" =~ ^[0-9a-fA-F:]+$ ]] && [[ "$a" == *":"* ]]; then
-        # 排除无效的纯冒号情况（如 ":" 或 ":::"）
-        [[ "$a" =~ [0-9a-fA-F] ]] && return 0
+    [[ "$d" == .* || "$d" == *. || "$d" == *..* ]] && return 1
+    local IFS='.'
+    local -a labels
+    read -ra labels <<< "$d"
+    local lbl last=""
+    for lbl in "${labels[@]}"; do
+        [[ "$lbl" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]] || return 1
+        last="$lbl"
+    done
+    # 顶级域必须是 2 位以上字母或 punycode（xn--...）
+    [[ "$last" =~ ^([a-zA-Z]{2,63}|[xX][nN]--[a-zA-Z0-9-]{1,59})$ ]]
+}
+
+# 规范化目标地址：去掉空白字符；若用户从节点链接直接粘贴了 [IPv6]，自动去掉方括号
+normalize_target_addr() {
+    local a
+    a="$(printf '%s' "${1:-}" | tr -d '[:space:]')"
+    if [[ "$a" == \[*\] ]] && [[ "$a" == *":"* ]]; then
+        a="${a#\[}"
+        a="${a%\]}"
     fi
-    # 域名：避免接受 "1.2.3.g" 这样的混合格式；要求不以数字点组合开头
-    if ! [[ "$a" =~ ^[0-9]+\. ]]; then
-        [[ "$a" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]] && return 0
+    printf '%s' "$a"
+}
+
+# 目标地址：合法 IPv4（不含 0.0.0.0）、合法 IPv6（不含 ::）或合法域名
+is_target_addr() {
+    local a="${1:-}"
+    [ -n "$a" ] || return 1
+    if [[ "$a" =~ ^[0-9.]+$ ]]; then
+        is_ipv4 "$a" && [ "$a" != "0.0.0.0" ]
+        return $?
     fi
-    return 1
+    if [[ "$a" == *":"* ]]; then
+        is_ipv6 "$a" && [[ "$a" =~ [1-9a-fA-F] ]]
+        return $?
+    fi
+    is_domain "$a"
+}
+
+is_loopback_addr() {
+    case "${1:-}" in
+        127.0.0.1|localhost|LOCALHOST|::1|0:0:0:0:0:0:0:1) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 # 通用提问函数：ask "提示语" "默认值" 变量名
 # 用户直接回车 → 用默认值；没给默认值 → 原样收下输入（由调用处再校验）
 ask() {
-    local prompt="$1" default="$2" var="$3"
-    local input=""
-    if [ -n "$default" ]; then
-        read -rp "$prompt [默认: $default]: " input || return 1
-        [ -z "$input" ] && input="$default"
+    local _ask_prompt="$1" _ask_default="$2" _ask_var="$3"
+    local _ask_input=""
+    if [ -n "$_ask_default" ]; then
+        read -rp "$_ask_prompt [默认: $_ask_default]: " _ask_input || return 1
+        [ -z "$_ask_input" ] && _ask_input="$_ask_default"
     else
-        read -rp "$prompt: " input || return 1
+        read -rp "$_ask_prompt: " _ask_input || return 1
     fi
-    printf -v "$var" '%s' "$input"
+    printf -v "$_ask_var" '%s' "$_ask_input"
 }
 
 # 是/否提问：ask_yes "提示语" "默认(y/n)"，返回 0=是，1=否
@@ -120,13 +217,20 @@ ask_yes() {
     [ "$default" = "y" ] && hint="Y/n"
     read -rp "$prompt [$hint]: " ans || return 1
     [ -z "$ans" ] && ans="$default"
-    [[ "$ans" =~ ^[Yy]$ ]]
+    [[ "$ans" =~ ^[Yy]([Ee][Ss])?$ ]]
 }
 
 # realm 配置里 remote 的写法：IPv6 地址要加方括号，不然会跟端口的冒号混淆
 # 比如 ::1:8080 是错的，[::1]:8080 才对
 fmt_remote() {
-    if [[ "$1" == *":"* ]]; then echo "[$1]:$2"; else echo "$1:$2"; fi
+    local addr="$1" port="$2"
+    addr="${addr#\[}"
+    addr="${addr%\]}"
+    if [[ "$addr" == *":"* ]]; then
+        printf '[%s]:%s\n' "$addr" "$port"
+    else
+        printf '%s:%s\n' "$addr" "$port"
+    fi
 }
 
 # ==================== 系统检测 ====================
@@ -149,11 +253,14 @@ detect_os() {
         say_err "没找到 apt-get 也没找到 apk，这个系统我不认识，装不了"
         exit 1
     fi
-    # 服务管理：有 systemctl 就是 systemd，有 rc-service 就是 OpenRC（Alpine）
-    if command -v systemctl >/dev/null 2>&1; then
+    # 服务管理：有 systemctl 且确实以 systemd 启动；或 Alpine OpenRC
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
         INIT_SYSTEM="systemd"
     elif command -v rc-service >/dev/null 2>&1; then
         INIT_SYSTEM="openrc"
+    elif command -v systemctl >/dev/null 2>&1; then
+        say_err "检测到 systemctl，但当前环境不是以 systemd 启动（比如 Docker 容器），无法管理后台服务"
+        exit 1
     else
         say_err "没找到 systemctl 也没找到 rc-service，不知道怎么管理服务"
         exit 1
@@ -161,47 +268,48 @@ detect_os() {
     say_info "检测到系统：包管理=${PKG_MGR}，服务管理=${INIT_SYSTEM}"
 }
 
+apt_install_retry() {
+    # 刚开机的机器常有系统自动更新占着 dpkg 锁：
+    # DPkg::Lock::Timeout 让 apt 自己等锁 120 秒，还不行就多试几轮。
+    local i
+    if ! DEBIAN_FRONTEND=noninteractive apt-get update -qq -o DPkg::Lock::Timeout=120 >"$CURL_LOG" 2>&1; then
+        say_warn "apt-get update 出错了，最后几行日志："
+        tail -n 5 "$CURL_LOG" 2>/dev/null | sed 's/^/  /'
+    fi
+    for i in 1 2 3 4 5; do
+        if DEBIAN_FRONTEND=noninteractive apt-get install -y -o DPkg::Lock::Timeout=120 "$@" >>"$CURL_LOG" 2>&1; then
+            return 0
+        fi
+        if [ "$i" -eq 5 ]; then
+            say_err "依赖安装失败（试了 5 次），最后几行日志："
+            tail -n 8 "$CURL_LOG" 2>/dev/null | sed 's/^/  /'
+            return 1
+        fi
+        say_warn "第 $i 次安装没成功（可能 dpkg 锁被系统更新占着），15 秒后重试…"
+        sleep 15
+    done
+}
+
 install_deps() {
-    # 脚本依赖的几个小工具：curl/wget 下载、tar 解压、ss 看端口占用
-    say_step "检查必备小工具（curl/wget/tar/ss）"
+    # 脚本依赖的小工具：curl 下载、tar 解压、ss 看端口占用、ca-certificates 校验 HTTPS 证书
+    say_step "检查必备小工具（curl/tar/ss/ca-certificates）"
     local need=()
     command -v curl >/dev/null 2>&1 || need+=("curl")
-    command -v wget >/dev/null 2>&1 || need+=("wget")
     command -v tar  >/dev/null 2>&1 || need+=("tar")
     command -v ss   >/dev/null 2>&1 || need+=("iproute2")  # ss 在 iproute2 包里
+    [ -e /etc/ssl/certs/ca-certificates.crt ] || need+=("ca-certificates")
     if [ "${#need[@]}" -eq 0 ]; then
         say_ok "小工具都齐了"
         return 0
     fi
     say_info "需要安装：${need[*]}，正在用 $PKG_MGR 安装…"
-    # apt 装包时把输出记到日志里：成功了保持界面干净，失败了打印最后几行，
-    # 不然两眼一抹黑，不知道卡在哪一步
     if [ "$PKG_MGR" = "apt-get" ]; then
-        if ! apt-get update -qq >"$CURL_LOG" 2>&1; then
-            say_warn "apt-get update 出错了，最后几行日志："
-            tail -n 5 "$CURL_LOG" 2>/dev/null | sed 's/^/  /'
-        fi
-        # 刚开机的机器常有系统自动更新占着 dpkg 锁：
-        # DPkg::Lock::Timeout 让 apt 自己等锁 120 秒，还不行就多试几轮，
-        # 免得上来就报错走人（L2TP-VPS 那边已经踩过这个坑）。
-        local i
-        for i in 1 2 3 4 5; do
-            if apt-get install -y -o DPkg::Lock::Timeout=120 "${need[@]}" >>"$CURL_LOG" 2>&1; then
-                break
-            fi
-            if [ "$i" -eq 5 ]; then
-                say_err "依赖安装失败（试了 5 次），最后几行日志："
-                tail -n 8 "$CURL_LOG" 2>/dev/null | sed 's/^/  /'
-                exit 1
-            fi
-            say_warn "第 $i 次安装没成功（可能 dpkg 锁被系统更新占着），15 秒后重试…"
-            sleep 15
-        done
+        apt_install_retry "${need[@]}" || return 1
     else
-        if ! apk add --no-cache "${need[@]}" >>"$CURL_LOG" 2>&1; then
+        if ! apk add --no-cache "${need[@]}" >"$CURL_LOG" 2>&1; then
             say_err "依赖安装失败，最后几行日志："
             tail -n 8 "$CURL_LOG" 2>/dev/null | sed 's/^/  /'
-            exit 1
+            return 1
         fi
     fi
     say_ok "小工具安装完成"
@@ -220,23 +328,20 @@ detect_arch() {
         armv6l|armv6)  echo "arm-unknown-linux-musleabihf" ;;
         *)
             say_err "你的 CPU 架构是 ${m}，realm 官方没提供这个架构的包，装不了"
-            exit 1
+            return 1
             ;;
     esac
 }
 
 get_realm_version() {
-    # 先问 GitHub API 拿最新版本号；问不到（比如 GitHub 连不上）就用内置版本保底，
-    # 反正下载时还有镜像可以轮询，不至于卡死。
-    # 注意：下面这三个提示必须走 stderr（>&2）！
-    # 因为调用处是 ver="$(get_realm_version)"，只取 stdout 的最后一行当版本号，
-    # 提示如果混进 stdout，会把版本号污染成多行乱码，下载链接就拼错了，安装必失败。
+    # 先问 GitHub API 拿最新版本号；问不到（比如 GitHub 连不上）就用内置版本保底。
+    # 注意：提示必须走 stderr（>&2），stdout 只输出版本号。
     say_info "正在查询 realm 最新版本…" >&2
     local ver=""
     ver="$(curl -fsSL --connect-timeout 8 --max-time 15 \
         "https://api.github.com/repos/$UPSTREAM_REPO/releases/latest" 2>/dev/null \
         | grep -o '"tag_name": *"[^" ]*"' | head -1 | cut -d'"' -f4)"
-    if [ -n "$ver" ]; then
+    if [[ "$ver" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][a-zA-Z0-9.]+)?$ ]]; then
         say_ok "官方最新版本：$ver" >&2
     else
         ver="$REALM_PIN_VERSION"
@@ -254,13 +359,12 @@ download_realm() {
     for prefix in "${MIRROR_PREFIXES[@]}"; do
         url="${prefix}${rel}"
         say_info "尝试下载：$url"
-        # -f：服务器报错（如404）就直接失败，不把错页存下来当压缩包
-        # -L：跟随跳转；--connect-timeout 10：10秒连不上就换源
-        # --max-time 300：单个源最多等5分钟，免得卡死
+        # -f：服务器报错（如 404）就直接失败，不把错页存下来当压缩包
+        # -L：跟随跳转；--connect-timeout 10：10 秒连不上就换源
+        # --max-time 300：单个源最多等 5 分钟，免得卡死
         if curl -fSL --connect-timeout 10 --max-time 300 -o "$dest" "$url" 2>"$CURL_LOG"; then
-            # 简单验货：压缩包里必须能解出名叫 realm 的文件，
-            # 防止下到个 HTML 错页还当宝贝供着
-            if tar -tzf "$dest" 2>/dev/null | grep -qx "realm"; then
+            # 简单验货：压缩包里必须能解出名叫 realm（或 ./realm）的文件
+            if tar -tzf "$dest" 2>/dev/null | grep -Eq '^(\./)?realm$'; then
                 say_ok "下载成功，验货通过"
                 return 0
             fi
@@ -283,18 +387,26 @@ install_realm_bin() {
             return 0
         fi
     fi
-    local ver asset tmpdir staged
+    local ver asset tmpdir staged bin_dir
+    asset="$(detect_arch)" || return 1
     ver="$(get_realm_version)"
-    asset="$(detect_arch)"
     say_info "目标安装包：realm-${asset}.tar.gz（版本 ${ver}）"
-    tmpdir="$(mktemp -d)"
-    download_realm "$ver" "$asset" "$tmpdir/realm.tar.gz" || { rm -rf "$tmpdir"; return 1; }
+    tmpdir="$(mktemp -d)" || return 1
+    if ! download_realm "$ver" "$asset" "$tmpdir/realm.tar.gz"; then
+        rm -rf "$tmpdir"
+        return 1
+    fi
     say_info "正在解压安装…"
-    if ! tar -xzf "$tmpdir/realm.tar.gz" -C "$tmpdir" || ! "$tmpdir/realm" --help >/dev/null 2>&1; then
+    if ! tar -xzf "$tmpdir/realm.tar.gz" -C "$tmpdir" \
+        || [ ! -f "$tmpdir/realm" ] \
+        || ! chmod +x "$tmpdir/realm" \
+        || ! "$tmpdir/realm" --help >/dev/null 2>&1; then
         rm -rf "$tmpdir"
         say_err "下载的 realm 无法运行，原版本未被覆盖"
         return 1
     fi
+    bin_dir="$(dirname "$BIN_PATH")"
+    mkdir -p "$bin_dir" || { rm -rf "$tmpdir"; return 1; }
     staged="$(mktemp "${BIN_PATH}.XXXXXX")" || { rm -rf "$tmpdir"; return 1; }
     if ! cp "$tmpdir/realm" "$staged" || ! chmod +x "$staged" || ! mv -f "$staged" "$BIN_PATH"; then
         rm -f "$staged"
@@ -308,27 +420,34 @@ install_realm_bin() {
         say_ok "realm 安装成功：${BIN_PATH}（版本 ${ver}）"
     else
         say_err "文件装好了但运行失败，可能是 CPU 架构不匹配，请检查"
-        exit 1
+        return 1
     fi
 }
 
 # ==================== 服务管理（屏蔽 systemd / OpenRC 差异） ====================
-# 不管你是 Debian 还是 Alpine，后面统一调 service_start/stop/restart 就行，
-# 不用记两套命令。
 service_start()   { if [ "$INIT_SYSTEM" = "openrc" ]; then rc-service realm start;   else systemctl start realm;   fi; }
 service_stop()    { if [ "$INIT_SYSTEM" = "openrc" ]; then rc-service realm stop;    else systemctl stop realm;    fi; }
 service_restart() { if [ "$INIT_SYSTEM" = "openrc" ]; then rc-service realm restart; else systemctl restart realm; fi; }
 service_enable() {
-    if [ "$INIT_SYSTEM" = "openrc" ]; then rc-update add realm default >/dev/null 2>&1
-    else systemctl enable realm >/dev/null 2>&1; fi
+    if [ "$INIT_SYSTEM" = "openrc" ]; then
+        rc-update add realm default >/dev/null 2>&1
+    else
+        systemctl enable realm >/dev/null 2>&1
+    fi
 }
 service_is_active() {
-    if [ "$INIT_SYSTEM" = "openrc" ]; then rc-service realm status >/dev/null 2>&1
-    else [ "$(systemctl is-active realm 2>/dev/null)" = "active" ]; fi
+    if [ "$INIT_SYSTEM" = "openrc" ]; then
+        rc-service realm status >/dev/null 2>&1
+    else
+        systemctl is-active --quiet realm 2>/dev/null
+    fi
 }
 service_is_enabled() {
-    if [ "$INIT_SYSTEM" = "openrc" ]; then rc-update show default 2>/dev/null | grep -qw "realm"
-    else [ "$(systemctl is-enabled realm 2>/dev/null)" = "enabled" ]; fi
+    if [ "$INIT_SYSTEM" = "openrc" ]; then
+        rc-update show default 2>/dev/null | awk '$1 == "realm" { found=1 } END { exit !found }'
+    else
+        systemctl is-enabled --quiet realm 2>/dev/null
+    fi
 }
 
 write_service() {
@@ -338,10 +457,11 @@ write_service() {
     say_step "配置 realm 系统服务（开机自启）"
     mkdir -p "$CONF_DIR"
     if [ "$INIT_SYSTEM" = "systemd" ]; then
-        cat > /etc/systemd/system/realm.service <<'EOF'
+        mkdir -p "$(dirname "$SYSTEMD_UNIT")"
+        cat > "$SYSTEMD_UNIT" <<'EOF'
 [Unit]
 Description=realm 高性能端口转发
-After=network-online.target
+After=network-online.target firewalld.service ufw.service netfilter-persistent.service
 Wants=network-online.target
 
 [Service]
@@ -356,10 +476,11 @@ LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 EOF
-        systemctl daemon-reload
+        systemctl daemon-reload || { say_err "systemd daemon-reload 失败"; return 1; }
     else
         # OpenRC：realm 自己不会转后台，靠 command_background=true 让 OpenRC 托管它
-        cat > /etc/init.d/realm <<'EOF'
+        mkdir -p "$(dirname "$OPENRC_INIT")"
+        cat > "$OPENRC_INIT" <<'EOF'
 #!/sbin/openrc-run
 name="realm 高性能端口转发"
 command="/usr/local/bin/realm"
@@ -369,7 +490,7 @@ pidfile="/run/realm.pid"
 
 depend() {
     need net
-    after firewall
+    after firewall iptables
 }
 
 # 端口跳跃的 iptables 规则：开机/重启时重新铺一遍，没开跳跃就跳过
@@ -378,7 +499,7 @@ start_pre() {
     return 0
 }
 EOF
-        chmod +x /etc/init.d/realm
+        chmod +x "$OPENRC_INIT"
     fi
     service_enable || { say_err "设置 realm 开机自启失败"; return 1; }
     say_ok "服务已配置，开机自动启动"
@@ -390,20 +511,25 @@ EOF
 # 比如：
 #   10000|8.8.8.8|443|转发到香港落地机
 ensure_rules_file() {
-    # 规则清单不存在就建一个（含 /etc/realm 目录），顺手写一行格式说明。
-    # # 开头的是注释，gen_config / list_rules / del_rule 都会跳过，不影响使用。
     if [ ! -f "$RULES_FILE" ]; then
         mkdir -p "$CONF_DIR"
         printf '# 格式：监听端口|目标地址|目标端口|备注\n' > "$RULES_FILE"
     fi
 }
 
+# 判断一条规则的字段是否合法（确保 list_rules / gen_config / del_rule / has_rules 口径一致）
+is_valid_rule_fields() {
+    local lport="${1:-}" raddr="${2:-}" rport="${3:-}"
+    [ -n "$lport" ] || return 1
+    case "$lport" in \#*) return 1 ;; esac
+    is_port "$lport" && is_target_addr "$raddr" && is_port "$rport"
+}
+
 gen_config() {
-    # 每次增删规则后都调它，根据 rules.list 重新生成 realm 的 config.json。
-    # realm 的 v2 版用 JSON 配置：endpoints 里一条就是一条转发。
-    # 先建目录：防止极端情况（比如有人手贱删了 /etc/realm）下重定向写文件失败，
-    # 连带后面的重启、验端口全跟着报错，把人看懵。
-    mkdir -p "$CONF_DIR"
+    # 每次增删规则后都调它，根据 rules.list 重新生成 realm 的 config.json（原子替换）
+    mkdir -p "$CONF_DIR" || return 1
+    local tmp
+    tmp="$(mktemp "$CONF_DIR/.config.json.XXXXXX")" || return 1
     {
         echo '{'
         echo '  "log": {"level": "warn", "output": "stdout"},'
@@ -412,28 +538,39 @@ gen_config() {
         echo '  "endpoints": ['
         local first=1 lport raddr rport note
         if [ -f "$RULES_FILE" ]; then
-            while IFS='|' read -r lport raddr rport note; do
-                [ -z "${lport:-}" ] && continue        # 跳过空行
-                case "$lport" in \#*) continue ;; esac # 跳过注释行
+            while IFS='|' read -r lport raddr rport note || [ -n "${lport:-}" ]; do
+                is_valid_rule_fields "${lport:-}" "${raddr:-}" "${rport:-}" || continue
                 if [ "$first" -eq 1 ]; then first=0; else echo ","; fi
-                # 监听地址写 0.0.0.0：本机所有 IPv4 地址都能连（IPv6 场景极少，先不折腾）
+                # 监听地址写 0.0.0.0：本机所有 IPv4 地址都能连
                 printf '    {"listen": "0.0.0.0:%s", "remote": "%s"}' \
                     "$lport" "$(fmt_remote "$raddr" "$rport")"
             done < "$RULES_FILE"
-            echo ""
         fi
+        [ "$first" -eq 0 ] && echo ""
         echo '  ]'
         echo '}'
-    } > "$CONF_FILE"
+    } > "$tmp" && mv -f "$tmp" "$CONF_FILE" || { rm -f "$tmp"; return 1; }
 }
 
-# 查某个监听端口是否已经有规则了
-rule_exists() { [ -f "$RULES_FILE" ] && grep -q "^$1|" "$RULES_FILE"; }
-has_rules() { [ -f "$RULES_FILE" ] && grep -q '^[0-9][0-9]*|' "$RULES_FILE"; }
+# 查某个监听端口是否已经有规则了（精确匹配第一列，防正则注入）
+rule_exists() {
+    is_port "${1:-}" || return 1
+    [ -f "$RULES_FILE" ] || return 1
+    awk -F'|' -v p="$1" '$1 == p { found=1; exit } END { exit !found }' "$RULES_FILE"
+}
+
+has_rules() {
+    [ -f "$RULES_FILE" ] || return 1
+    local lport raddr rport note
+    while IFS='|' read -r lport raddr rport note || [ -n "${lport:-}" ]; do
+        is_valid_rule_fields "${lport:-}" "${raddr:-}" "${rport:-}" && return 0
+    done < "$RULES_FILE"
+    return 1
+}
 
 # ==================== 防火墙放行 ====================
 record_firewall_rule() {
-    mkdir -p "$CONF_DIR"
+    mkdir -p "$CONF_DIR" || return 1
     local entry="$1|$2|$3"
     if [ -f "$FIREWALL_FILE" ] && grep -qxF "$entry" "$FIREWALL_FILE"; then return 0; fi
     printf '%s\n' "$entry" >> "$FIREWALL_FILE"
@@ -444,40 +581,54 @@ open_firewall() {
     # 按 ufw → firewalld → iptables 的顺序，能用哪个用哪个。
     # 注意：云厂商的安全组/防火墙在控制台里，脚本够不着，那个要自己去开。
     local port="$1" proto failed=0
-    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-        for proto in tcp udp; do
-            if ! ufw status 2>/dev/null | awk -v rule="$port/$proto" '$1 == rule { found=1 } END { exit !found }'; then
-                if ufw allow "$port/$proto" >/dev/null 2>&1; then
-                    record_firewall_rule "$port" ufw "$proto" || { say_warn "无法记录 $port/$proto 的防火墙归属"; failed=1; }
-                else
-                    say_warn "ufw 放行 $port/$proto 失败，请检查防火墙"
-                    failed=1
+    if command -v ufw >/dev/null 2>&1; then
+        local ufw_out
+        ufw_out="$(LC_ALL=C ufw status 2>/dev/null || true)"
+        if printf '%s\n' "$ufw_out" | grep -q "Status: active"; then
+            for proto in tcp udp; do
+                if ! printf '%s\n' "$ufw_out" | awk -v rule="$port/$proto" -v bare="$port" '
+                    ($1 == rule || $1 == bare) && $2 == "ALLOW" && ($3 == "Anywhere" || ($3 == "IN" && $4 == "Anywhere")) { found=1 }
+                    END { exit !found }'; then
+                    if ufw allow "$port/$proto" >/dev/null 2>&1; then
+                        record_firewall_rule "$port" ufw "$proto" || { say_warn "无法记录 $port/$proto 的防火墙归属"; failed=1; }
+                    else
+                        say_warn "ufw 放行 $port/$proto 失败，请检查防火墙"
+                        failed=1
+                    fi
                 fi
-            fi
-        done
-        if [ "$failed" -eq 0 ]; then say_ok "系统防火墙已放行 ${port}（ufw，TCP+UDP）"; fi
-        return "$failed"
+            done
+            if [ "$failed" -eq 0 ]; then say_ok "系统防火墙已放行 ${port}（ufw，TCP+UDP）"; fi
+            return "$failed"
+        fi
     fi
     if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        local fw_changed=0
         for proto in tcp udp; do
             if ! firewall-cmd --permanent --query-port="$port/$proto" >/dev/null 2>&1; then
                 if firewall-cmd --permanent --add-port="$port/$proto" >/dev/null 2>&1; then
+                    fw_changed=1
                     record_firewall_rule "$port" firewalld "$proto" || { say_warn "无法记录 $port/$proto 的防火墙归属"; failed=1; }
                 else
                     say_warn "firewalld 放行 $port/$proto 失败，请检查防火墙"
                     failed=1
                 fi
+            elif ! firewall-cmd --query-port="$port/$proto" >/dev/null 2>&1; then
+                fw_changed=1
             fi
         done
-        firewall-cmd --reload >/dev/null 2>&1 || failed=1
+        if [ "$fw_changed" -eq 1 ]; then
+            firewall-cmd --reload >/dev/null 2>&1 || failed=1
+        fi
         if [ "$failed" -eq 0 ]; then say_ok "系统防火墙已放行 ${port}（firewalld，TCP+UDP）"; fi
         return "$failed"
     fi
     if command -v iptables >/dev/null 2>&1; then
         # 已有规则可能是管理员手工添加的，不登记为本脚本所有。
+        local ipt_changed=0
         for proto in tcp udp; do
-            if ! iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT >/dev/null 2>&1; then
-                if iptables -I INPUT -p "$proto" --dport "$port" -j ACCEPT >/dev/null 2>&1; then
+            if ! iptables -w 5 -C INPUT -p "$proto" --dport "$port" -j ACCEPT >/dev/null 2>&1; then
+                if iptables -w 5 -I INPUT -p "$proto" --dport "$port" -j ACCEPT >/dev/null 2>&1; then
+                    ipt_changed=1
                     record_firewall_rule "$port" iptables "$proto" || { say_warn "无法记录 $port/$proto 的防火墙归属"; failed=1; }
                 else
                     say_warn "iptables 放行 $port/$proto 失败，请检查防火墙"
@@ -485,7 +636,7 @@ open_firewall() {
                 fi
             fi
         done
-        save_firewall  # 规则存盘，重启后还在
+        [ "$ipt_changed" -eq 1 ] && save_firewall 1  # 规则存盘，重启后还在
         if [ "$failed" -eq 0 ]; then say_ok "系统防火墙已放行 ${port}（iptables，TCP+UDP）"; fi
         return "$failed"
     fi
@@ -496,56 +647,104 @@ open_firewall() {
 close_firewall() {
     # 只回收自己添加的规则，且使用当时记录的后端；旧安装没有登记的规则保留。
     local port="$1" saved_port backend proto tmp
+    local reload_firewalld=0 save_ipt=0 rc
     [ -f "$FIREWALL_FILE" ] || return 0
-    tmp="$(mktemp)" || return 1
-    while IFS='|' read -r saved_port backend proto; do
+    mkdir -p "$CONF_DIR" || return 1
+    tmp="$(mktemp "$CONF_DIR/.firewall.XXXXXX")" || return 1
+    while IFS='|' read -r saved_port backend proto || [ -n "${saved_port:-}" ]; do
+        [ -z "${saved_port:-}" ] && continue
         if [ "$saved_port" != "$port" ]; then
             printf '%s|%s|%s\n' "$saved_port" "$backend" "$proto" >> "$tmp"
             continue
         fi
+        rc=0
         case "$backend" in
-            ufw) command -v ufw >/dev/null 2>&1 && ufw --force delete allow "$port/$proto" >/dev/null 2>&1 ;;
-            firewalld) command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --permanent --remove-port="$port/$proto" >/dev/null 2>&1 ;;
-            iptables) command -v iptables >/dev/null 2>&1 && iptables -D INPUT -p "$proto" --dport "$port" -j ACCEPT >/dev/null 2>&1 ;;
-            *) false ;;
+            ufw)
+                if command -v ufw >/dev/null 2>&1; then
+                    ufw --force delete allow "$port/$proto" >/dev/null 2>&1 || rc=1
+                else
+                    rc=1
+                fi
+                ;;
+            firewalld)
+                if command -v firewall-cmd >/dev/null 2>&1; then
+                    if firewall-cmd --permanent --query-port="$port/$proto" >/dev/null 2>&1; then
+                        if firewall-cmd --permanent --remove-port="$port/$proto" >/dev/null 2>&1; then
+                            reload_firewalld=1
+                        else
+                            rc=1
+                        fi
+                    fi
+                else
+                    rc=1
+                fi
+                ;;
+            iptables)
+                if command -v iptables >/dev/null 2>&1; then
+                    if iptables -w 5 -C INPUT -p "$proto" --dport "$port" -j ACCEPT >/dev/null 2>&1; then
+                        if iptables -w 5 -D INPUT -p "$proto" --dport "$port" -j ACCEPT >/dev/null 2>&1; then
+                            save_ipt=1
+                        else
+                            rc=1
+                        fi
+                    fi
+                else
+                    rc=1
+                fi
+                ;;
+            *)
+                rc=1
+                ;;
         esac
-        if [ "$?" -ne 0 ]; then
+        if [ "$rc" -ne 0 ]; then
             say_warn "未能回收 $backend 的 $port/$proto 放行规则，请手动检查"
             printf '%s|%s|%s\n' "$saved_port" "$backend" "$proto" >> "$tmp"
-        elif [ "$backend" = firewalld ]; then
-            firewall-cmd --reload >/dev/null 2>&1 || true
         fi
     done < "$FIREWALL_FILE"
-    mv -f "$tmp" "$FIREWALL_FILE"
+    mv -f "$tmp" "$FIREWALL_FILE" || { rm -f "$tmp"; return 1; }
+    if [ "$reload_firewalld" -eq 1 ]; then
+        firewall-cmd --reload >/dev/null 2>&1 || true
+    fi
+    if [ "$save_ipt" -eq 1 ]; then
+        save_firewall 0
+    fi
     return 0
 }
 
 save_firewall() {
     # 把当前 iptables 规则存盘，重启后还在。
-    # ufw / firewalld 自己会持久化，不用管；只有纯 iptables 需要手动存。
-    # 尽力而为：存失败也不报错，不影响主流程。
+    # $1=1 允许按需安装 iptables-persistent；$1=0 只在已安装持久化服务时存盘（避免删规则/卸载时误装包）。
+    # ufw / firewalld 自己会持久化，不要在它们启用时调用本函数。
+    local allow_install="${1:-0}"
     if [ "$PKG_MGR" = "apk" ]; then
-        # Alpine：iptables 服务负责存盘和开机恢复
         if [ -f /etc/init.d/iptables ]; then
-            rc-update add iptables default >/dev/null 2>&1
-            /etc/init.d/iptables save >/dev/null 2>&1
+            rc-update add iptables default >/dev/null 2>&1 || true
+            /etc/init.d/iptables save >/dev/null 2>&1 || true
         fi
         return 0
     fi
-    # Debian/Ubuntu：靠 iptables-persistent（netfilter-persistent save）
     if command -v netfilter-persistent >/dev/null 2>&1; then
-        netfilter-persistent save >/dev/null 2>&1
-    elif command -v iptables-save >/dev/null 2>&1; then
-        DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent >/dev/null 2>&1
-        command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1
+        netfilter-persistent save >/dev/null 2>&1 || true
+    elif [ "$allow_install" -eq 1 ] && [ "$PKG_MGR" = "apt-get" ] && command -v iptables-save >/dev/null 2>&1; then
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -o DPkg::Lock::Timeout=120 iptables-persistent >/dev/null 2>&1 || true
+        if command -v netfilter-persistent >/dev/null 2>&1; then
+            netfilter-persistent save >/dev/null 2>&1 || true
+        fi
     fi
     return 0
 }
 
 get_public_ip() {
-    # 尽量拿个公网 IP 显示出来，方便你知道"别人该连哪个 IP"。
-    # 拿不到也不影响，就是少显示一行。
-    curl -fsSL --connect-timeout 5 --max-time 8 https://ipinfo.io/ip 2>/dev/null | tr -d ' \n\r' || true
+    # 尽量拿本机公网 IPv4（realm 监听 0.0.0.0，强制 -4 避免双栈机拿到 IPv6）
+    local url ip=""
+    for url in "https://api4.ipify.org" "https://ipv4.icanhazip.com" "https://ipinfo.io/ip" "https://ifconfig.me/ip"; do
+        ip="$(curl -4 -fsSL --connect-timeout 4 --max-time 6 "$url" 2>/dev/null | tr -d '[:space:]' || true)"
+        if is_ipv4 "$ip"; then
+            printf '%s\n' "$ip"
+            return 0
+        fi
+    done
+    return 0
 }
 
 # ==================== 端口跳跃（给 Hysteria2 节点用） ====================
@@ -557,10 +756,10 @@ get_public_ip() {
 # 端口段：20000-50000 或 20000:50000 都认，起始端口要小于结束端口
 # 用法：parse_port_range "输入" 起始变量名 结束变量名
 parse_port_range() {
-    # 局部变量故意起怪名字：要是跟调用处传进来的变量名重了，printf -v 就写不回去了
     local _pr_s _pr_e
     [[ "${1:-}" =~ ^([0-9]{1,5})[-:]([0-9]{1,5})$ ]] || return 1
-    _pr_s=$((10#${BASH_REMATCH[1]})); _pr_e=$((10#${BASH_REMATCH[2]}))  # 10#：去掉前导 0，防止被当成八进制
+    _pr_s=$((10#${BASH_REMATCH[1]}))
+    _pr_e=$((10#${BASH_REMATCH[2]}))
     is_port "$_pr_s" && is_port "$_pr_e" && [ "$_pr_s" -lt "$_pr_e" ] || return 1
     printf -v "$2" '%s' "$_pr_s"
     printf -v "$3" '%s' "$_pr_e"
@@ -569,7 +768,7 @@ parse_port_range() {
 # 查某个监听端口开了哪段跳跃，输出 "起始-结束"，没开就什么都不输出
 get_hop() {
     [ -f "$HOP_FILE" ] || return 0
-    awk -F'|' -v p="$1" '$1 == p { print $2 "-" $3; exit }' "$HOP_FILE"
+    awk -F'|' -v p="$1" '$1 == p && $2 != "" && $3 != "" { print $2 "-" $3; exit }' "$HOP_FILE"
 }
 
 # 端口段会不会跟别的规则打架？会就报错说明原因并返回 0
@@ -577,8 +776,9 @@ get_hop() {
 hop_conflict() {
     local own="$1" s="$2" e="$3" p a b
     if [ -f "$RULES_FILE" ]; then
-        while IFS='|' read -r p _; do
+        while IFS='|' read -r p _ || [ -n "${p:-}" ]; do
             case "$p" in ''|\#*) continue ;; esac
+            is_port "$p" || continue
             [ "$p" = "$own" ] && continue
             if [ "$p" -ge "$s" ] && [ "$p" -le "$e" ]; then
                 say_err "端口段 $s-$e 里包含另一条规则的端口 ${p}，会抢走它的 UDP 流量，换个端口段吧"
@@ -587,8 +787,9 @@ hop_conflict() {
         done < "$RULES_FILE"
     fi
     if [ -f "$HOP_FILE" ]; then
-        while IFS='|' read -r p a b; do
-            { [ -z "$p" ] || [ "$p" = "$own" ]; } && continue
+        while IFS='|' read -r p a b || [ -n "${p:-}" ]; do
+            is_port "$p" && is_port "$a" && is_port "$b" || continue
+            [ "$p" = "$own" ] && continue
             if [ "$s" -le "$b" ] && [ "$a" -le "$e" ]; then
                 say_err "端口段 $s-$e 跟端口 $p 的跳跃端口段 $a-$b 重叠了，换个端口段吧"
                 return 0
@@ -602,8 +803,9 @@ hop_conflict() {
 port_in_other_hop() {
     local port="$1" p a b
     [ -f "$HOP_FILE" ] || return 1
-    while IFS='|' read -r p a b; do
-        { [ -z "$p" ] || [ "$p" = "$port" ]; } && continue
+    while IFS='|' read -r p a b || [ -n "${p:-}" ]; do
+        is_port "$p" && is_port "$a" && is_port "$b" || continue
+        [ "$p" = "$port" ] && continue
         if [ "$port" -ge "$a" ] && [ "$port" -le "$b" ]; then
             say_err "端口 $port 在端口 $p 的跳跃端口段 $a-$b 里面，UDP 会被导走，换个端口吧"
             return 0
@@ -615,8 +817,26 @@ port_in_other_hop() {
 # 端口段里有没有别的程序在用 UDP？有就逐行打出来（realm 自己的不算）
 hop_udp_busy() {
     ss -ulnpH 2>/dev/null | awk -v s="$1" -v e="$2" '
+        NR == 1 && $1 == "State" { next }
         /"realm"/ { next }
-        { n = split($4, a, ":"); p = a[n] + 0; if (p >= s && p <= e) print "  " $4 "  " $NF }'
+        {
+            col = ($1 ~ /^(tcp|udp)$/) ? $5 : $4
+            n = split(col, a, ":")
+            p = a[n] + 0
+            if (p >= s && p <= e) print "  " col "  " $NF
+        }'
+}
+
+# 检查本机某个端口是否已被其他程序占用（TCP + UDP）
+port_holder() {
+    local port="$1"
+    { ss -tlnpH 2>/dev/null; ss -ulnpH 2>/dev/null; } | awk -v port="$port" '
+        $1 == "State" || $1 == "Netid" { next }
+        {
+            col = ($1 ~ /^(tcp|udp)$/) ? $5 : $4
+            n = split(col, a, ":")
+            if (a[n] == port) { print; exit }
+        }'
 }
 
 ensure_iptables() {
@@ -624,543 +844,784 @@ ensure_iptables() {
     command -v iptables >/dev/null 2>&1 && return 0
     say_info "端口跳跃需要 iptables，正在安装…"
     if [ "$PKG_MGR" = "apt-get" ]; then
-        DEBIAN_FRONTEND=noninteractive apt-get install -y -o DPkg::Lock::Timeout=120 iptables >"$CURL_LOG" 2>&1
+        apt_install_retry iptables || return 1
     elif [ "$PKG_MGR" = "apk" ]; then
-        apk add --no-cache iptables >"$CURL_LOG" 2>&1
+        if ! apk add --no-cache iptables >"$CURL_LOG" 2>&1; then
+            say_err "iptables 安装失败，最后几行日志："
+            tail -n 5 "$CURL_LOG" 2>/dev/null | sed 's/^/  /'
+            return 1
+        fi
     fi
     command -v iptables >/dev/null 2>&1 && return 0
-    say_err "iptables 安装失败，最后几行日志："
-    tail -n 5 "$CURL_LOG" 2>/dev/null | sed 's/^/  /'
+    say_err "iptables 安装失败，请手动安装后重试"
     return 1
 }
 
 write_hop_script() {
-    # 根据 hop.list 生成 hop.sh。规则全放在自己的 ZHUANFA_HOP 链里：
+    # 根据 hop.list 生成 hop.sh（原子写入）。规则全放在自己的 ZHUANFA_HOP 链里：
     # 每次先整条链删干净再重建，跑多少遍都不会重复，也不碰别人的 iptables 规则。
-    mkdir -p "$CONF_DIR"
-    local p s e
+    mkdir -p "$CONF_DIR" || return 1
+    local tmp p s e
+    local -a lines=()
+    if [ -f "$HOP_FILE" ]; then
+        while IFS='|' read -r p s e || [ -n "${p:-}" ]; do
+            is_port "$p" && is_port "$s" && is_port "$e" && [ "$s" -lt "$e" ] || continue
+            lines+=("iptables -w 5 -t nat -A ZHUANFA_HOP -p udp --dport $s:$e -j REDIRECT --to-ports $p || ok=1")
+        done < "$HOP_FILE"
+    fi
+    tmp="$(mktemp "$CONF_DIR/.hop.sh.XXXXXX")" || return 1
     {
         echo '#!/bin/sh'
         echo '# 由 zhuanfa 脚本根据 hop.list 自动生成，不用手改'
         echo 'command -v iptables >/dev/null 2>&1 || exit 0'
-        echo 'while iptables -t nat -D PREROUTING -p udp -m addrtype --dst-type LOCAL -j ZHUANFA_HOP 2>/dev/null; do :; done'
-        echo 'iptables -t nat -F ZHUANFA_HOP 2>/dev/null'
-        echo 'iptables -t nat -X ZHUANFA_HOP 2>/dev/null'
-        if [ -f "$HOP_FILE" ] && grep -q '^[0-9]' "$HOP_FILE"; then
+        echo 'while iptables -w 5 -t nat -D PREROUTING -p udp -m addrtype --dst-type LOCAL -j ZHUANFA_HOP 2>/dev/null; do :; done'
+        echo 'iptables -w 5 -t nat -F ZHUANFA_HOP 2>/dev/null || true'
+        echo 'iptables -w 5 -t nat -X ZHUANFA_HOP 2>/dev/null || true'
+        if [ "${#lines[@]}" -gt 0 ]; then
             echo 'ok=0'
-            echo 'iptables -t nat -N ZHUANFA_HOP || ok=1'
-            while IFS='|' read -r p s e; do
-                [ -z "$p" ] && continue
-                echo "iptables -t nat -A ZHUANFA_HOP -p udp --dport $s:$e -j REDIRECT --to-ports $p || ok=1"
-            done < "$HOP_FILE"
+            echo 'iptables -w 5 -t nat -N ZHUANFA_HOP || ok=1'
+            local line
+            for line in "${lines[@]}"; do
+                echo "$line"
+            done
             # 只接管发给本机的包，免得误伤本机上 Docker 之类转出去的流量
-            echo 'iptables -t nat -I PREROUTING 1 -p udp -m addrtype --dst-type LOCAL -j ZHUANFA_HOP || ok=1'
+            echo 'iptables -w 5 -t nat -I PREROUTING 1 -p udp -m addrtype --dst-type LOCAL -j ZHUANFA_HOP || ok=1'
             echo 'exit $ok'
+        else
+            echo 'exit 0'
         fi
-    } > "$HOP_SCRIPT"
-    chmod +x "$HOP_SCRIPT"
+    } > "$tmp" && chmod +x "$tmp" && mv -f "$tmp" "$HOP_SCRIPT" || { rm -f "$tmp"; return 1; }
 }
 
-run_hop_script() { sh "$HOP_SCRIPT" >/dev/null 2>&1; }
+run_hop_script() {
+    sh "$HOP_SCRIPT" >"$CURL_LOG" 2>&1
+}
 
 ensure_hop_hook() {
     # 老版本脚本装的服务文件里没有"启动前先跑 hop.sh"这一步，
     # 不补上的话重启机器后端口跳跃就没了。这里检测一下，缺了就重写服务文件。
-    local f="/etc/systemd/system/realm.service"
-    [ "$INIT_SYSTEM" = "openrc" ] && f="/etc/init.d/realm"
+    local f="$SYSTEMD_UNIT"
+    [ "$INIT_SYSTEM" = "openrc" ] && f="$OPENRC_INIT"
     [ -n "$INIT_SYSTEM" ] || return 0
     grep -q 'hop.sh' "$f" 2>/dev/null && return 0
-    write_service >/dev/null
+    write_service >/dev/null || say_warn "未能更新服务文件以自动恢复端口跳跃，请手动检查"
 }
 
 # 设置 / 关闭某个监听端口的端口跳跃：set_hop 端口 "起始-结束"（第二个参数留空 = 关闭）
 set_hop() {
-    local port="$1" range="${2:-}" s="" e="" tmp
+    local port="$1" range="${2:-}" s="" e="" tmp backup="" had_hop_file=0
     if [ -n "$range" ]; then
         parse_port_range "$range" s e || { say_err "端口段不合法：$range"; return 1; }
         ensure_iptables || return 1
     elif [ -z "$(get_hop "$port")" ]; then
         # 这条本来就没开跳跃。但前面 firewall-cmd --reload 之类的操作可能把
         # nat 表冲掉了，别的规则的跳跃也跟着没了，所以顺手重铺一遍
-        if [ -f "$HOP_SCRIPT" ]; then run_hop_script || say_warn "端口跳跃规则重铺失败，可以手动跑：sh $HOP_SCRIPT"; fi
+        if [ -f "$HOP_SCRIPT" ]; then
+            if ! run_hop_script; then
+                say_warn "端口跳跃规则重铺失败，可以手动跑：sh $HOP_SCRIPT"
+                [ -s "$CURL_LOG" ] && tail -n 3 "$CURL_LOG" | sed 's/^/  /'
+            fi
+        fi
         return 0
     fi
-    mkdir -p "$CONF_DIR"
-    tmp="$(mktemp)" || return 1
-    [ -f "$HOP_FILE" ] && awk -F'|' -v p="$port" '$1 != p' "$HOP_FILE" > "$tmp"
-    [ -n "$range" ] && printf '%s|%s|%s\n' "$port" "$s" "$e" >> "$tmp"
-    mv -f "$tmp" "$HOP_FILE" || { rm -f "$tmp"; return 1; }
-    write_hop_script || return 1
-    if ! run_hop_script; then
-        say_err "端口跳跃的 iptables 规则没加上，可以手动跑一下看报错：sh $HOP_SCRIPT"
+    mkdir -p "$CONF_DIR" || return 1
+    if [ -f "$HOP_FILE" ]; then
+        had_hop_file=1
+        backup="$(mktemp "$CONF_DIR/.hop.bak.XXXXXX")" || return 1
+        cp -p "$HOP_FILE" "$backup" || { rm -f "$backup"; return 1; }
+    fi
+    tmp="$(mktemp "$CONF_DIR/.hop.XXXXXX")" || { rm -f "$backup"; return 1; }
+    if [ "$had_hop_file" -eq 1 ]; then
+        awk -F'|' -v p="$port" '$1 != p' "$HOP_FILE" > "$tmp"
+    fi
+    if [ -n "$range" ]; then
+        printf '%s|%s|%s\n' "$port" "$s" "$e" >> "$tmp"
+    fi
+    if ! mv -f "$tmp" "$HOP_FILE"; then
+        rm -f "$tmp" "$backup"
         return 1
     fi
+    if ! write_hop_script || ! run_hop_script; then
+        local err_tail=""
+        [ -s "$CURL_LOG" ] && err_tail="$(tail -n 3 "$CURL_LOG")"
+        # 回滚 hop.list 和 hop.sh，避免列表显示与实际 iptables 不一致或破坏已有跳跃规则
+        if [ "$had_hop_file" -eq 1 ]; then
+            cp -p "$backup" "$HOP_FILE" 2>/dev/null || true
+        else
+            rm -f "$HOP_FILE"
+        fi
+        rm -f "$backup"
+        write_hop_script >/dev/null 2>&1 && run_hop_script >/dev/null 2>&1 || true
+        say_err "端口跳跃的 iptables 规则未生效，已恢复原有跳跃配置"
+        if [ -n "$err_tail" ]; then
+            printf '%s\n' "$err_tail" | sed 's/^/  /' >&2
+        fi
+        return 1
+    fi
+    rm -f "$backup"
     [ -n "$range" ] && ensure_hop_hook
     return 0
 }
 
 # ==================== 规则管理 ====================
 need_installed() {
-# 加/删规则前先确认 realm 装好了，没装就指条明路
-if [ ! -x "$BIN_PATH" ]; then
-say_err "realm 还没安装，请先选菜单 1 安装"
-return 1
-fi
+    # 加/删规则前先确认 realm 装好了，没装就指条明路
+    if [ ! -x "$BIN_PATH" ]; then
+        say_err "realm 还没安装，请先选菜单 1 安装"
+        return 1
+    fi
 }
 
 list_rules() {
-echo ""
-say_info "========== 当前转发规则 =========="
-if [ ! -f "$RULES_FILE" ] || [ -z "$(grep -v '^#' "$RULES_FILE" 2>/dev/null | grep -v '^$' || true)" ]; then
-say_info "还没有任何规则，选菜单 2 添加第一条吧"
-return 1
-fi
-local i=0 lport raddr rport note hop
-while IFS='|' read -r lport raddr rport note; do
-[ -z "${lport:-}" ] && continue
-case "$lport" in \#*) continue;; esac
-i=$((i + 1))
-printf "  [%d] 中转端口 %s  →  落地机 %s" "$i" "$lport" "$(fmt_remote "$raddr" "$rport")"
-[ -n "${note:-}" ] && printf " （%s）" "$note"
-hop="$(get_hop "$lport")"
-[ -n "$hop" ] && printf "  [端口跳跃 UDP %s]" "$hop"
-echo ""
-done < "$RULES_FILE"
-say_info "共 $i 条规则（TCP 和 UDP 都转）"
-return 0
+    echo ""
+    say_info "========== 当前转发规则 =========="
+    if ! has_rules; then
+        say_info "还没有任何规则，选菜单 2 添加第一条吧"
+        return 1
+    fi
+    local i=0 lport raddr rport note hop
+    while IFS='|' read -r lport raddr rport note || [ -n "${lport:-}" ]; do
+        is_valid_rule_fields "${lport:-}" "${raddr:-}" "${rport:-}" || continue
+        i=$((i + 1))
+        printf "  [%d] 中转端口 %s  →  落地机 %s" "$i" "$lport" "$(fmt_remote "$raddr" "$rport")"
+        [ -n "${note:-}" ] && printf " （%s）" "$note"
+        hop="$(get_hop "$lport")"
+        [ -n "$hop" ] && printf "  [端口跳跃 UDP %s]" "$hop"
+        echo ""
+    done < "$RULES_FILE"
+    say_info "共 $i 条规则（TCP 和 UDP 都转）"
+    return 0
+}
+
+# 检查 realm 是否正在监听指定端口
+port_is_listening() {
+    local port="$1" out
+    out="$(ss -tlnp 2>/dev/null || true)"
+    if printf '%s\n' "$out" | grep -q 'users:(('; then
+        printf '%s\n' "$out" | awk -v port="$port" '
+            /"realm"/ {
+                col = ($1 ~ /^(tcp|udp)$/) ? $5 : $4
+                n = split(col, a, ":")
+                if (a[n] == port) { found=1; exit }
+            }
+            END { exit !found }'
+    else
+        printf '%s\n' "$out" | awk -v port="$port" '
+            $1 == "State" || $1 == "Netid" { next }
+            {
+                col = ($1 ~ /^(tcp|udp)$/) ? $5 : $4
+                n = split(col, a, ":")
+                if (a[n] == port) { found=1; exit }
+            }
+            END { exit !found }'
+    fi
 }
 
 # 重启服务让新配置生效，并确认端口真的在监听
 apply_and_verify() {
-local port="$1"
-gen_config || return 1
-say_info "正在重启 realm 服务使规则生效…"
-if ! service_restart; then
-say_err "服务重启失败！用菜单 6 看看状态，或检查配置文件：$CONF_FILE"
-return 1
-fi
-local attempt
-for attempt in 1 2 3; do
-    sleep 1
-    if service_is_active && ss -tln 2>/dev/null | grep -Eq ":$port[[:space:]]"; then
-        say_ok "端口 $port 已在监听，规则生效！"
-        return 0
+    local port="$1"
+    gen_config || return 1
+    say_info "正在重启 realm 服务使规则生效…"
+    if ! service_restart; then
+        say_err "服务重启失败！用菜单 6 看看状态，或检查配置文件：$CONF_FILE"
+        return 1
     fi
-done
-say_err "服务未运行或端口 $port 未监听，规则未生效"
-return 1
+    local attempt
+    for attempt in 1 2 3; do
+        sleep 1
+        if service_is_active && port_is_listening "$port"; then
+            say_ok "端口 $port 已在监听，规则生效！"
+            return 0
+        fi
+    done
+    say_err "服务未运行或端口 $port 未由 realm 监听，规则未生效"
+    return 1
 }
 
 # 先保存原规则；新配置无法启动时，恢复原规则和配置。
 change_rules() {
-local action="$1" port="$2" addr="${3:-}" remote_port="${4:-}" note="${5:-}" backup
-ensure_rules_file
-backup="$(mktemp)" || return 1
-cp -p "$RULES_FILE" "$backup" || { rm -f "$backup"; return 1; }
-sed -i "/^$port|/d" "$RULES_FILE" || { cp -p "$backup" "$RULES_FILE"; rm -f "$backup"; return 1; }
-if [ "$action" = add ]; then
-    if ! printf '%s|%s|%s|%s\n' "$port" "$addr" "$remote_port" "$note" >> "$RULES_FILE"; then
-        cp -p "$backup" "$RULES_FILE"
-        rm -f "$backup"
+    local action="$1" port="$2" addr="${3:-}" remote_port="${4:-}" note="${5:-}"
+    local backup tmp
+    is_port "$port" || { say_err "监听端口不合法：$port"; return 1; }
+    ensure_rules_file || return 1
+    backup="$(mktemp "$CONF_DIR/.rules.bak.XXXXXX")" || return 1
+    cp -p "$RULES_FILE" "$backup" || { rm -f "$backup"; return 1; }
+    tmp="$(mktemp "$CONF_DIR/.rules.tmp.XXXXXX")" || { rm -f "$backup"; return 1; }
+    if ! awk -F'|' -v p="$port" '$1 != p' "$RULES_FILE" > "$tmp"; then
+        rm -f "$tmp" "$backup"
         return 1
     fi
-fi
-if [ "$action" = add ]; then
-    apply_and_verify "$port" && { rm -f "$backup"; return 0; }
-else
-    if gen_config; then
-        if has_rules; then
-            service_restart && service_is_active && { rm -f "$backup"; return 0; }
-        else
-            service_stop && { rm -f "$backup"; return 0; }
+    if [ "$action" = "add" ]; then
+        if ! printf '%s|%s|%s|%s\n' "$port" "$addr" "$remote_port" "$note" >> "$tmp"; then
+            rm -f "$tmp" "$backup"
+            return 1
         fi
     fi
-fi
-say_warn "应用新规则失败，正在恢复原规则"
-cp -p "$backup" "$RULES_FILE" || { say_err "恢复原规则文件失败：$RULES_FILE"; rm -f "$backup"; return 1; }
-rm -f "$backup"
-gen_config || { say_err "恢复原配置文件失败：$CONF_FILE"; return 1; }
-service_restart >/dev/null 2>&1 || say_err "原规则也未能重新启动，请检查服务状态"
-return 1
+    if ! mv -f "$tmp" "$RULES_FILE"; then
+        rm -f "$tmp" "$backup"
+        return 1
+    fi
+    if [ "$action" = "add" ]; then
+        if apply_and_verify "$port"; then
+            rm -f "$backup"
+            return 0
+        fi
+    else
+        if gen_config; then
+            if has_rules; then
+                if service_restart && sleep 1 && service_is_active; then
+                    rm -f "$backup"
+                    return 0
+                fi
+            else
+                if service_stop; then
+                    rm -f "$backup"
+                    return 0
+                fi
+            fi
+        fi
+    fi
+    say_warn "应用新规则失败，正在恢复原规则"
+    cp -p "$backup" "$RULES_FILE" || { say_err "恢复原规则文件失败：$RULES_FILE"; rm -f "$backup"; return 1; }
+    rm -f "$backup"
+    gen_config || { say_err "恢复原配置文件失败：$CONF_FILE"; return 1; }
+    if has_rules; then
+        service_restart >/dev/null 2>&1 || say_err "原规则也未能重新启动，请检查服务状态"
+    else
+        service_stop >/dev/null 2>&1 || true
+    fi
+    return 1
+}
+
+probe_tcp_target() {
+    local addr="$1" port="$2"
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 5 bash -c ': >"/dev/tcp/$1/$2"' _ "$addr" "$port" 2>/dev/null
+    else
+        bash -c ': >"/dev/tcp/$1/$2"' _ "$addr" "$port" 2>/dev/null
+    fi
 }
 
 add_rule() {
-need_installed || return 1
-# 两种用法：
-# 交互：直接调 add_rule，跟着向导一步步填（菜单 2 就是这么进来的）
-# 非交互：环境变量传参，适合老手写脚本调用：
-# LISTEN_PORT=10000 TARGET_ADDR=1.2.3.4 TARGET_PORT=443 NOTE="备注" bash install.sh add
-# 要端口跳跃再加 HOP_RANGE=20000-50000（不加 = 这条规则不开跳跃）
-local lport="${LISTEN_PORT:-}" raddr="${TARGET_ADDR:-}" rport="${TARGET_PORT:-}" note="${NOTE:-}"
-local hop_range="${HOP_RANGE:-}" hop_s="" hop_e=""
-if [ -z "$lport$raddr$rport" ]; then
-# ---------------- 交互式向导 ----------------
-# 非交互终端（stdin 不是键盘，比如被重定向/管道占了）下 read 会直接读到 EOF，
-# 下面的 while 循环会死循环刷屏。与其这样，不如直接报错指条明路。
-if [ ! -t 0 ]; then
-say_err "当前不是交互终端，进不了填表向导。请把三个参数一次传进来："
-say_err '  LISTEN_PORT=10000 TARGET_ADDR=1.2.3.4 TARGET_PORT=443 NOTE="备注" bash install.sh add'
-return 1
-fi
-echo ""
-say_info "========== 添加转发规则 =========="
-say_info "先看懂这张图，后面要填的东西都在图里："
-echo ""
-echo "   你的手机/电脑  ──→  这台中转机:【中转端口】  ──→  落地机IP:【节点端口】"
-echo ""
-say_info " 落地机 = 你的节点真正所在的那台服务器"
-say_info " 节点端口 = 节点本来的端口（落地机上的）"
-say_info " 中转端口 = 在这台中转机上开的端口，客户端以后连的就是它"
-# 第 1 步：落地机地址
-while true; do
-echo ""
-say_info "【第 1 步】落地机地址：你的节点在哪台服务器上？"
-say_info " 就是你原来节点链接里 @ 后面、冒号前面的那段。"
-say_info " 比如节点链接是 hy2://密码@1.2.3.4:443 ，这里就填 1.2.3.4"
-ask "请输入落地机 IP 或域名" "" raddr || return 1
-raddr="$(echo "$raddr" | tr -d ' ')" # 顺手去掉不小心带上的空格
-is_target_addr "$raddr" && break
-say_err "地址格式不对，IP 或域名都行，比如 1.2.3.4"
-done
-# 第 2 步：节点端口（落地机上的端口）
-while true; do
-echo ""
-say_info "【第 2 步】节点端口：节点在落地机上用的是哪个端口？"
-say_info " 就是原来节点链接里 IP 后面冒号后的数字。"
-say_info " 比如 hy2://密码@1.2.3.4:443 ，这里就填 443"
-say_info " 落地机开了端口跳跃的，填它真正的端口：在落地机上运行 ss -ulnp | grep -i hy 看"
-ask "请输入节点端口 (1-65535)" "" rport || return 1
-is_port "$rport" && break
-say_err "端口不合法，请输入 1~65535 的数字"
-done
-# 第 3 步：中转端口（本机监听端口）
-while true; do
-echo ""
-say_info "【第 3 步】中转端口：在这台中转机上开哪个端口？"
-say_info " 以后客户端里的端口就改成这个。"
-say_info " 不知道填啥？直接回车，就用跟节点端口一样的数字（${rport}），最不容易搞混。"
-ask "请输入中转端口 (1-65535)" "$rport" lport || return 1
-if ! is_port "$lport"; then say_err "端口不合法，请输入 1~65535 的数字"; continue; fi
-port_in_other_hop "$lport" && continue
-if rule_exists "$lport"; then
-say_warn "端口 $lport 已经有一条规则了"
-ask_yes "是否覆盖旧规则" "n" || { say_info "已取消"; return 1;}
-break
-fi
-# 端口被别的程序占了就提醒一声；被谁占了一目了然，自己判断
-local holder
-holder="$(ss -tlnp 2>/dev/null | grep ":$lport " | head -1 || true)"
-if [ -n "$holder" ]; then
-say_warn "端口 $lport 已经被占用了："
-echo " $(echo "$holder" | head -c 200)"
-ask_yes "仍要继续吗（可能转发不起来）" "n" || { say_info "已取消"; return 1;}
-fi
-break
-done
-# 第 4 步：端口跳跃（可选）
-echo ""
-say_info "【第 4 步】端口跳跃（可选）：只有目标是 Hysteria2 节点、并且你想用「端口跳跃」才需要开。"
-say_info " 开了之后，客户端连本机一整段端口（比如 ${HOP_DEFAULT_RANGE}）都能用。"
-say_info " 不知道是啥？直接回车跳过就行，不影响正常转发。"
-local old_hop hop_busy
-old_hop="$(get_hop "$lport")"
-if ask_yes "要开启端口跳跃吗" "$([ -n "$old_hop" ] && echo y || echo n)"; then
-while true; do
-say_info " 填一段端口，格式：起始端口-结束端口。不懂就直接回车用默认的。"
-ask "请输入跳跃端口段" "${old_hop:-$HOP_DEFAULT_RANGE}" hop_range || return 1
-hop_range="$(echo "$hop_range" | tr -d ' ')"
-if ! parse_port_range "$hop_range" hop_s hop_e; then
-say_err "格式不对，要写成 20000-50000 这样，前面的数字要比后面小"
-continue
-fi
-hop_conflict "$lport" "$hop_s" "$hop_e" && continue
-hop_busy="$(hop_udp_busy "$hop_s" "$hop_e")"
-if [ -n "$hop_busy" ]; then
-say_warn "这段端口里已经有别的程序在用 UDP，开了跳跃它们就收不到 UDP 了："
-echo "$hop_busy" | head -n 5
-ask_yes "仍要用这个端口段吗（选 n 重新填一段）" "n" || continue
-fi
-hop_range="$hop_s-$hop_e"
-break
-done
-else
-hop_range=""
-fi
-# 第 5 步：备注（可选）
-echo ""
-say_info "【第 5 步】备注（可选）：给这条规则起个名，比如\"香港落地机\"，直接回车跳过"
-ask "请输入备注" "" note || return 1
-if [[ "$note" == *'|'* || "$note" == *$'\n'* || "$note" == *$'\r'* ]]; then
-    say_err "备注不能包含竖线或换行"
-    return 1
-fi
-# 最后跟你确认一遍，免得手滑填错
-echo ""
-say_info "---------- 请确认 ----------"
-echo "   你的手机/电脑  ──→  这台中转机:${lport}  ──→  $(fmt_remote "$raddr" "$rport")"
-echo ""
-echo " 中转端口（这台机器）： $lport"
-echo " 落地机地址：           $raddr"
-echo " 节点端口（落地机）：   $rport"
-[ -n "$note" ] && echo " 备注：                 $note"
-[ -n "$hop_range" ] && echo " 端口跳跃：             这台机器的 UDP $hop_range 都会转到中转端口 $lport"
-echo " （TCP 和 UDP 都会转）"
-ask_yes "确认添加这条规则" "y" || { say_info "已取消"; return 1;}
-# 目标连通性顺手测一下：连不上就提醒（多半是地址/端口填错了），但不强制拦你，
-# 毕竟对方可能只是暂时没开机
-if ! timeout 5 bash -c "echo >/dev/tcp/$raddr/$rport" 2>/dev/null; then
-say_warn "现在用 TCP 连 $(fmt_remote "$raddr" "$rport") 没连上：可能是地址/端口填错了，也可能是对方暂时没开机"
-say_info " 注意：Hysteria2、TUIC 这类节点只用 UDP，TCP 本来就连不上，这种情况直接回车继续就行"
-ask_yes "仍要添加吗（直接回车 = 添加）" "y" || { say_info "已取消"; return 1;}
-else
-say_ok "目标 $(fmt_remote "$raddr" "$rport") 现在能连通"
-fi
-else
-# ---------------- 非交互：参数走环境变量 ----------------
-is_port "$lport" || { say_err "LISTEN_PORT 不合法：$lport"; return 1;}
-is_target_addr "$raddr" || { say_err "TARGET_ADDR 不合法：$raddr"; return 1;}
-is_port "$rport" || { say_err "TARGET_PORT 不合法：$rport"; return 1;}
-if [ -n "$hop_range" ]; then
-    parse_port_range "$hop_range" hop_s hop_e || { say_err "HOP_RANGE 不合法：${hop_range}（要写成 20000-50000）"; return 1; }
-    hop_conflict "$lport" "$hop_s" "$hop_e" && return 1
-    [ -n "$(hop_udp_busy "$hop_s" "$hop_e")" ] && say_warn "端口段 $hop_s-$hop_e 里已有别的程序在用 UDP，开跳跃后它们会收不到 UDP"
-    hop_range="$hop_s-$hop_e"
-fi
-fi
-if [[ "$note" == *'|'* || "$note" == *$'\n'* || "$note" == *$'\r'* ]]; then
-    say_err "备注不能包含竖线或换行"
-    return 1
-fi
-port_in_other_hop "$lport" && return 1
-change_rules add "$lport" "$raddr" "$rport" "$note" || return 1
-open_firewall "$lport" || say_warn "转发已配置，但防火墙未完全放行 ${lport}，请检查系统防火墙"
-local pubip hop_ok=0
-pubip="$(get_public_ip)"
-# 覆盖旧规则时 hop_range 为空，set_hop 会顺手把旧的跳跃关掉
-if ! set_hop "$lport" "$hop_range"; then
-    hop_ok=1
-    say_warn "端口跳跃没开成功，但单端口转发是好的，客户端先填单个端口 ${lport} 用着"
-fi
-echo ""
-say_ok "本机转发已启动：${pubip:-这台机器的IP}:${lport} → $(fmt_remote "$raddr" "$rport")"
-if [ -n "$hop_range" ] && [ "$hop_ok" -eq 0 ]; then
-    say_ok "端口跳跃已开启：本机 UDP ${hop_range} 都会转到这条规则"
+    need_installed || return 1
+    # 两种用法：
+    # 交互：直接调 add_rule，跟着向导一步步填（菜单 2 就是这么进来的）
+    # 非交互：环境变量传参，适合老手写脚本调用：
+    #   LISTEN_PORT=10000 TARGET_ADDR=1.2.3.4 TARGET_PORT=443 NOTE="备注" bash install.sh add
+    #   要端口跳跃再加 HOP_RANGE=20000-50000（不加 = 这条规则不开跳跃）
+    local lport="${LISTEN_PORT:-}" raddr="${TARGET_ADDR:-}" rport="${TARGET_PORT:-}" note="${NOTE:-}"
+    local hop_range="${HOP_RANGE:-}" hop_s="" hop_e=""
+    if [ -z "$lport$raddr$rport" ]; then
+        # ---------------- 交互式向导 ----------------
+        if [ ! -t 0 ]; then
+            say_err "当前不是交互终端，进不了填表向导。请把三个参数一次传进来："
+            say_err '  LISTEN_PORT=10000 TARGET_ADDR=1.2.3.4 TARGET_PORT=443 NOTE="备注" bash install.sh add'
+            return 1
+        fi
+        echo ""
+        say_info "========== 添加转发规则 =========="
+        say_info "先看懂这张图，后面要填的东西都在图里："
+        echo ""
+        echo "   你的手机/电脑  ──→  这台中转机:【中转端口】  ──→  落地机IP:【节点端口】"
+        echo ""
+        say_info " 落地机   = 你的节点真正所在的那台服务器"
+        say_info " 节点端口 = 节点本来的端口（落地机上的）"
+        say_info " 中转端口 = 在这台中转机上开的端口，客户端以后连的就是它"
+        # 第 1 步：落地机地址
+        while true; do
+            echo ""
+            say_info "【第 1 步】落地机地址：你的节点在哪台服务器上？"
+            say_info " 就是你原来节点链接里 @ 后面、冒号前面的那段。"
+            say_info " 比如节点链接是 hy2://密码@1.2.3.4:443 ，这里就填 1.2.3.4"
+            ask "请输入落地机 IP 或域名" "" raddr || return 1
+            raddr="$(normalize_target_addr "$raddr")"
+            is_target_addr "$raddr" && break
+            say_err "地址格式不对（不要带端口），IP 或域名都行，比如 1.2.3.4"
+        done
+        # 第 2 步：节点端口（落地机上的端口）
+        while true; do
+            echo ""
+            say_info "【第 2 步】节点端口：节点在落地机上用的是哪个端口？"
+            say_info " 就是原来节点链接里 IP 后面冒号后的数字。"
+            say_info " 比如 hy2://密码@1.2.3.4:443 ，这里就填 443"
+            say_info " 落地机开了端口跳跃的，填它真正的端口：在落地机上运行 ss -ulnp | grep -i hy 看"
+            ask "请输入节点端口 (1-65535)" "" rport || return 1
+            rport="$(printf '%s' "$rport" | tr -d '[:space:]')"
+            is_port "$rport" && break
+            say_err "端口不合法，请输入 1~65535 的数字（不要带前导 0）"
+        done
+        # 第 3 步：中转端口（本机监听端口）
+        while true; do
+            echo ""
+            say_info "【第 3 步】中转端口：在这台中转机上开哪个端口？"
+            say_info " 以后客户端里的端口就改成这个。"
+            say_info " 不知道填啥？直接回车，就用跟节点端口一样的数字（${rport}），最不容易搞混。"
+            ask "请输入中转端口 (1-65535)" "$rport" lport || return 1
+            lport="$(printf '%s' "$lport" | tr -d '[:space:]')"
+            if ! is_port "$lport"; then
+                say_err "端口不合法，请输入 1~65535 的数字（不要带前导 0）"
+                continue
+            fi
+            if is_loopback_addr "$raddr" && [ "$lport" = "$rport" ]; then
+                say_err "中转端口和本机目标端口相同（${raddr}:${rport}），会造成死循环，请换个端口"
+                continue
+            fi
+            port_in_other_hop "$lport" && continue
+            if rule_exists "$lport"; then
+                say_warn "端口 $lport 已经有一条规则了"
+                ask_yes "是否覆盖旧规则" "n" || { say_info "已取消"; return 1; }
+                break
+            fi
+            local holder
+            holder="$(port_holder "$lport")"
+            if [ -n "$holder" ]; then
+                say_warn "端口 $lport 已经被其他程序占用了："
+                printf '  %s\n' "$(printf '%s' "$holder" | head -c 200)"
+                ask_yes "仍要继续吗（可能转发不起来）" "n" || { say_info "已取消"; return 1; }
+            fi
+            break
+        done
+        # 第 4 步：端口跳跃（可选）
+        echo ""
+        say_info "【第 4 步】端口跳跃（可选）：只有目标是 Hysteria2 节点、并且你想用「端口跳跃」才需要开。"
+        say_info " 开了之后，客户端连本机一整段端口（比如 ${HOP_DEFAULT_RANGE}）都能用。"
+        say_info " 不知道是啥？直接回车跳过就行，不影响正常转发。"
+        local old_hop hop_busy
+        old_hop="$(get_hop "$lport")"
+        if ask_yes "要开启端口跳跃吗" "$([ -n "$old_hop" ] && echo y || echo n)"; then
+            while true; do
+                say_info " 填一段端口，格式：起始端口-结束端口。不懂就直接回车用默认的。"
+                ask "请输入跳跃端口段" "${old_hop:-$HOP_DEFAULT_RANGE}" hop_range || return 1
+                hop_range="$(printf '%s' "$hop_range" | tr -d '[:space:]')"
+                if ! parse_port_range "$hop_range" hop_s hop_e; then
+                    say_err "格式不对，要写成 20000-50000 这样，前面的数字要比后面小"
+                    continue
+                fi
+                hop_conflict "$lport" "$hop_s" "$hop_e" && continue
+                hop_busy="$(hop_udp_busy "$hop_s" "$hop_e")"
+                if [ -n "$hop_busy" ]; then
+                    say_warn "这段端口里已经有别的程序在用 UDP，开了跳跃它们就收不到 UDP 了："
+                    printf '%s\n' "$hop_busy" | head -n 5
+                    ask_yes "仍要用这个端口段吗（选 n 重新填一段）" "n" || continue
+                fi
+                hop_range="$hop_s-$hop_e"
+                break
+            done
+        else
+            hop_range=""
+        fi
+        # 第 5 步：备注（可选）
+        while true; do
+            echo ""
+            say_info "【第 5 步】备注（可选）：给这条规则起个名，比如\"香港落地机\"，直接回车跳过"
+            ask "请输入备注" "" note || return 1
+            if [[ "$note" == *'|'* || "$note" == *$'\n'* || "$note" == *$'\r'* ]]; then
+                say_err "备注不能包含竖线（|）或换行，请重新输入"
+                continue
+            fi
+            break
+        done
+        # 最后跟你确认一遍，免得手滑填错
+        echo ""
+        say_info "---------- 请确认 ----------"
+        echo "   你的手机/电脑  ──→  这台中转机:${lport}  ──→  $(fmt_remote "$raddr" "$rport")"
+        echo ""
+        echo " 中转端口（这台机器）： $lport"
+        echo " 落地机地址：           $raddr"
+        echo " 节点端口（落地机）：   $rport"
+        [ -n "$note" ] && echo " 备注：                 $note"
+        [ -n "$hop_range" ] && echo " 端口跳跃：             这台机器的 UDP $hop_range 都会转到中转端口 $lport"
+        echo " （TCP 和 UDP 都会转）"
+        ask_yes "确认添加这条规则" "y" || { say_info "已取消"; return 1; }
+        # 目标连通性顺手测一下：连不上就提醒，但不强制拦你（UDP 节点 TCP 本来就不通）
+        if ! probe_tcp_target "$raddr" "$rport"; then
+            say_warn "现在用 TCP 连 $(fmt_remote "$raddr" "$rport") 没连上：可能是地址/端口填错了，也可能是对方暂时没开机"
+            say_info " 注意：Hysteria2、TUIC 这类节点只用 UDP，TCP 本来就连不上，这种情况直接回车继续就行"
+            ask_yes "仍要添加吗（直接回车 = 添加）" "y" || { say_info "已取消"; return 1; }
+        else
+            say_ok "目标 $(fmt_remote "$raddr" "$rport") 现在能连通"
+        fi
+    else
+        # ---------------- 非交互：参数走环境变量 ----------------
+        lport="$(printf '%s' "$lport" | tr -d '[:space:]')"
+        raddr="$(normalize_target_addr "$raddr")"
+        rport="$(printf '%s' "$rport" | tr -d '[:space:]')"
+        hop_range="$(printf '%s' "$hop_range" | tr -d '[:space:]')"
+        is_port "$lport" || { say_err "LISTEN_PORT 不合法：$lport"; return 1; }
+        is_target_addr "$raddr" || { say_err "TARGET_ADDR 不合法：$raddr"; return 1; }
+        is_port "$rport" || { say_err "TARGET_PORT 不合法：$rport"; return 1; }
+        if is_loopback_addr "$raddr" && [ "$lport" = "$rport" ]; then
+            say_err "LISTEN_PORT 与本机 TARGET_PORT 相同（${raddr}:${rport}），会造成死循环"
+            return 1
+        fi
+        if [ -n "$hop_range" ]; then
+            parse_port_range "$hop_range" hop_s hop_e || { say_err "HOP_RANGE 不合法：${hop_range}（要写成 20000-50000）"; return 1; }
+            hop_conflict "$lport" "$hop_s" "$hop_e" && return 1
+            [ -n "$(hop_udp_busy "$hop_s" "$hop_e")" ] && say_warn "端口段 $hop_s-$hop_e 里已有别的程序在用 UDP，开跳跃后它们会收不到 UDP"
+            hop_range="$hop_s-$hop_e"
+        fi
+    fi
+    if [[ "$note" == *'|'* || "$note" == *$'\n'* || "$note" == *$'\r'* ]]; then
+        say_err "备注不能包含竖线或换行"
+        return 1
+    fi
+    port_in_other_hop "$lport" && return 1
+    change_rules add "$lport" "$raddr" "$rport" "$note" || return 1
+    open_firewall "$lport" || say_warn "转发已配置，但防火墙未完全放行 ${lport}，请检查系统防火墙"
+    local pubip hop_ok=0
+    pubip="$(get_public_ip)"
+    # 覆盖旧规则时 hop_range 为空，set_hop 会顺手把旧的跳跃关掉
+    if ! set_hop "$lport" "$hop_range"; then
+        hop_ok=1
+        if [ -n "$hop_range" ]; then
+            say_warn "端口跳跃没开成功，但单端口转发是好的，客户端先填单个端口 ${lport} 用着"
+        else
+            say_warn "旧的端口跳跃规则未能完全清理，请手动检查：sh $HOP_SCRIPT"
+        fi
+    fi
     echo ""
-    say_info "---------- 客户端怎么改 ----------"
-    echo " 原来节点里的服务器地址换成本机的，端口换成端口段："
-    echo "   hy2:// 链接 / Hysteria2 官方客户端：服务器写 ${pubip:-这台机器的IP}:${hop_range}"
-    echo "   Clash Meta（mihomo）：server 写 ${pubip:-这台机器的IP}，port 写 ${lport}，再加一行 ports: ${hop_range}"
-    echo " 密码、SNI（域名）、证书设置这些都照旧，不要改"
-    echo " 不想跳跃也行：端口直接填 ${lport}"
-    echo ""
-    say_warn "记得去云服务器控制台的「安全组/防火墙」里放行 UDP ${hop_range}，脚本改不到那里"
-else
-    echo ""
-    say_info "---------- 客户端怎么改 ----------"
-    echo " 服务器地址：$raddr  改成  ${pubip:-这台机器的IP}"
-    if [ "$rport" = "$lport" ]; then echo " 端口：      ${lport}（不用改）"
-    else echo " 端口：      $rport  改成  ${lport}"; fi
-    echo " 密码、SNI（域名）、证书设置这些都照旧，不要改"
-    echo ""
-    say_warn "记得去云服务器控制台的「安全组/防火墙」里放行端口 ${lport}（TCP 和 UDP），脚本改不到那里"
-fi
-say_info "外部能否访问，还取决于云安全组、NAT 映射和目标服务器状态"
+    say_ok "本机转发已启动：${pubip:-这台机器的IP}:${lport} → $(fmt_remote "$raddr" "$rport")"
+    if [ -n "$hop_range" ] && [ "$hop_ok" -eq 0 ]; then
+        say_ok "端口跳跃已开启：本机 UDP ${hop_range} 都会转到这条规则"
+        echo ""
+        say_info "---------- 客户端怎么改 ----------"
+        echo " 原来节点里的服务器地址换成本机的，端口换成端口段："
+        echo "   hy2:// 链接 / Hysteria2 官方客户端：服务器写 ${pubip:-这台机器的IP}:${hop_range}"
+        echo "   Clash Meta（mihomo）：server 写 ${pubip:-这台机器的IP}，port 写 ${lport}，再加一行 ports: ${hop_range}"
+        echo " 密码、SNI（域名）、证书设置这些都照旧，不要改"
+        echo " 不想跳跃也行：端口直接填 ${lport}"
+        echo ""
+        say_warn "记得去云服务器控制台的「安全组/防火墙」里放行 UDP ${hop_range}（如需直连单端口，也放行 ${lport}），脚本改不到那里"
+    else
+        echo ""
+        say_info "---------- 客户端怎么改 ----------"
+        echo " 服务器地址：$raddr  改成  ${pubip:-这台机器的IP}"
+        if [ "$rport" = "$lport" ]; then
+            echo " 端口：      ${lport}（不用改）"
+        else
+            echo " 端口：      $rport  改成  ${lport}"
+        fi
+        echo " 密码、SNI（域名）、证书设置这些都照旧，不要改"
+        echo ""
+        say_warn "记得去云服务器控制台的「安全组/防火墙」里放行端口 ${lport}（TCP 和 UDP），脚本改不到那里"
+    fi
+    say_info "外部能否访问，还取决于云安全组、NAT 映射和目标服务器状态"
 }
 
 del_rule() {
-need_installed || return 1
-# 两种用法：交互（按序号删）/ 非交互（LISTEN_PORT=端口 bash install.sh del）
-local lport="${LISTEN_PORT:-}"
-if [ -z "$lport" ]; then
-list_rules || return 1
-echo ""
-local choice=""
-ask "请输入要删除的规则序号（按上面 [数字] 填）" "" choice || return 1
-[[ "$choice" =~ ^[0-9]+$ ]] || { say_err "请输入数字序号"; return 1; }
-# 把序号换算成本机端口：第 N 条非空行 | 切出第一列
-lport="$(grep -v '^#' "$RULES_FILE" | grep -v '^$' | sed -n "${choice}p" | cut -d'|' -f1)"
-[ -z "$lport" ] && { say_err "没有这个序号"; return 1;}
-ask_yes "确认删除本机端口 $lport 的规则" "n" || { say_info "已取消"; return 1;}
-fi
-rule_exists "$lport" || { say_err "端口 $lport 没有对应的规则"; return 1;}
-change_rules del "$lport" || return 1
-close_firewall "$lport"  # 回收这条规则放行的防火墙端口
-# 放在防火墙操作之后：firewall-cmd --reload 可能冲掉 nat 表，这里删完顺便把剩下的跳跃重铺
-set_hop "$lport" "" || say_warn "端口 $lport 的跳跃规则没删干净，可以手动跑：sh $HOP_SCRIPT"
-save_firewall
-say_ok "已删除端口 $lport 的规则"
+    need_installed || return 1
+    # 两种用法：交互（按序号删）/ 非交互（LISTEN_PORT=端口 bash install.sh del）
+    local lport="${LISTEN_PORT:-}"
+    if [ -z "$lport" ]; then
+        if [ ! -t 0 ]; then
+            say_err "当前不是交互终端，请用环境变量指定要删除的监听端口："
+            say_err "  LISTEN_PORT=10000 bash install.sh del"
+            return 1
+        fi
+        list_rules || return 1
+        echo ""
+        local choice=""
+        ask "请输入要删除的规则序号（按上面 [数字] 填）" "" choice || return 1
+        choice="$(printf '%s' "$choice" | tr -d '[:space:]')"
+        [[ "$choice" =~ ^[1-9][0-9]*$ ]] || { say_err "请输入正整数序号"; return 1; }
+        # 与 list_rules 共用同一校验逻辑，保证序号与规则严格一致
+        local idx=0 _p _a _rp _n
+        while IFS='|' read -r _p _a _rp _n || [ -n "${_p:-}" ]; do
+            is_valid_rule_fields "${_p:-}" "${_a:-}" "${_rp:-}" || continue
+            idx=$((idx + 1))
+            if [ "$idx" -eq "$choice" ]; then
+                lport="$_p"
+                break
+            fi
+        done < "$RULES_FILE"
+        [ -z "$lport" ] && { say_err "没有这个序号"; return 1; }
+        ask_yes "确认删除本机端口 $lport 的规则" "n" || { say_info "已取消"; return 1; }
+    else
+        lport="$(printf '%s' "$lport" | tr -d '[:space:]')"
+        is_port "$lport" || { say_err "LISTEN_PORT 不合法：$lport"; return 1; }
+    fi
+    rule_exists "$lport" || { say_err "端口 $lport 没有对应的规则"; return 1; }
+    local had_hop=""
+    had_hop="$(get_hop "$lport")"
+    change_rules del "$lport" || return 1
+    close_firewall "$lport"  # 回收这条规则放行的防火墙端口（仅 iptables 改动时会存盘）
+    # 放在防火墙操作之后：firewall-cmd --reload 可能冲掉 nat 表，这里删完顺便把剩下的跳跃重铺
+    set_hop "$lport" "" || say_warn "端口 $lport 的跳跃规则没删干净，可以手动跑：sh $HOP_SCRIPT"
+    [ -n "$had_hop" ] && save_firewall 0
+    say_ok "已删除端口 $lport 的规则"
+}
+
+do_restart() {
+    need_installed || return 1
+    if ! has_rules; then
+        say_warn "还没有转发规则，不需要启动服务；请先选菜单 2 添加规则"
+        return 1
+    fi
+    gen_config || { say_err "生成配置文件失败"; return 1; }
+    if service_restart && sleep 1 && service_is_active; then
+        say_ok "服务已重启并正常运行"
+        return 0
+    fi
+    say_err "重启失败，用菜单 6 看看状态"
+    return 1
 }
 
 # ==================== 安装 / 卸载 ====================
-do_install() {
-say_step "开始安装 realm"
-need_root
-detect_os
-install_deps
-local old_bin="" staged=""
-if [ -x "$BIN_PATH" ]; then
-    old_bin="$(mktemp)" || return 1
-    cp -p "$BIN_PATH" "$old_bin" || { rm -f "$old_bin"; return 1; }
-fi
-write_service || { rm -f "$old_bin"; return 1; }
-install_realm_bin || { rm -f "$old_bin"; return 1; }
-# 保证规则清单和配置文件存在。注意：已有规则不会被清空，放心重装。
-ensure_rules_file || { rm -f "$old_bin"; return 1; }
-gen_config || { rm -f "$old_bin"; return 1; }
-if has_rules; then
-    say_info "正在启动服务…"
-    if service_restart && sleep 1 && service_is_active; then
-        say_ok "realm 服务运行中，开机自启已设置"
-    else
-        if [ -n "$old_bin" ]; then
-            staged="$(mktemp "${BIN_PATH}.XXXXXX")" || true
-            if [ -n "$staged" ] && cp -p "$old_bin" "$staged" && mv -f "$staged" "$BIN_PATH"; then
-                service_restart >/dev/null 2>&1 || say_err "旧版本也未能重新启动，请检查服务状态"
-                say_warn "已恢复原来的 realm 程序"
-            else
-                rm -f "$staged"
-                say_err "无法恢复原来的 realm 程序；备份保存在 $old_bin"
-                old_bin=""
-            fi
+restore_old_bin() {
+    local old_bin="$1" staged=""
+    [ -n "$old_bin" ] && [ -f "$old_bin" ] || return 0
+    staged="$(mktemp "${BIN_PATH}.XXXXXX")" || true
+    if [ -n "$staged" ] && cp -p "$old_bin" "$staged" && mv -f "$staged" "$BIN_PATH"; then
+        if has_rules; then
+            service_restart >/dev/null 2>&1 || say_err "旧版本也未能重新启动，请检查服务状态"
         fi
+        say_warn "已恢复原来的 realm 程序"
+        return 0
+    fi
+    rm -f "$staged"
+    say_err "无法恢复原来的 realm 程序；备份保存在 $old_bin"
+    return 1
+}
+
+do_install() {
+    say_step "开始安装 realm"
+    need_root
+    detect_os
+    install_deps || return 1
+    local old_bin=""
+    if [ -x "$BIN_PATH" ]; then
+        old_bin="$(mktemp)" || return 1
+        cp -p "$BIN_PATH" "$old_bin" || { rm -f "$old_bin"; return 1; }
+    fi
+    if ! install_realm_bin; then
         rm -f "$old_bin"
-        say_err "服务未能启动，安装未完成；请用菜单 6 检查状态"
         return 1
     fi
-else
-    service_stop >/dev/null 2>&1 || true
-    say_info "还没有转发规则；添加第一条规则后会启动服务"
-fi
-rm -f "$old_bin"
-install_shortcut
-echo ""
-say_ok "安装完成！以后在终端输入 zhuanfa 就能打开管理菜单"
+    if ! write_service || ! ensure_rules_file || ! gen_config; then
+        if ! restore_old_bin "$old_bin"; then
+            old_bin=""
+        fi
+        rm -f "$old_bin"
+        return 1
+    fi
+    if has_rules; then
+        say_info "正在启动服务…"
+        if service_restart && sleep 1 && service_is_active; then
+            say_ok "realm 服务运行中，开机自启已设置"
+        else
+            if ! restore_old_bin "$old_bin"; then
+                old_bin=""
+            fi
+            rm -f "$old_bin"
+            say_err "服务未能启动，安装未完成；请用菜单 6 检查状态"
+            return 1
+        fi
+    else
+        service_stop >/dev/null 2>&1 || true
+        say_info "还没有转发规则；添加第一条规则后会启动服务"
+    fi
+    rm -f "$old_bin"
+    install_shortcut
+    echo ""
+    say_ok "安装完成！以后在终端输入 zhuanfa 就能打开管理菜单"
 }
 
 install_shortcut() {
-# 把脚本自身复制一份到 /usr/local/bin/zhuanfa，做成快捷命令。
-# 如果是管道/进程替换方式运行的（$0 不是普通文件），就没东西可复制，跳过。
-case "$0" in
-/dev/fd/*|/proc/self/fd/*) return 0;;
-esac
-if [ -f "$0" ]; then
-if cp -f "$0" "$SHORTCUT" && chmod +x "$SHORTCUT"; then
-say_ok "快捷命令已创建：以后直接输入 zhuanfa 打开菜单"
-fi
-fi
+    # 把脚本自身复制一份到 /usr/local/bin/zhuanfa，做成快捷命令。
+    # 如果是管道/进程替换方式运行的（$0 不是普通文件），就没东西可复制，跳过。
+    case "$0" in
+        /dev/fd/*|/proc/self/fd/*) return 0 ;;
+    esac
+    [ -f "$0" ] || return 0
+    [ "$0" -ef "$SHORTCUT" ] && return 0
+    local sc_dir tmp
+    sc_dir="$(dirname "$SHORTCUT")"
+    mkdir -p "$sc_dir" || return 1
+    tmp="$(mktemp "${SHORTCUT}.XXXXXX")" || return 1
+    if cp "$0" "$tmp" && chmod +x "$tmp" && mv -f "$tmp" "$SHORTCUT"; then
+        say_ok "快捷命令已创建：以后直接输入 zhuanfa 打开菜单"
+    else
+        rm -f "$tmp"
+        return 1
+    fi
 }
 
 do_uninstall() {
-say_warn "即将删除：realm 程序、系统服务、全部转发规则和配置"
-# 非交互卸载时传 UNINSTALL_CONFIRM=yes 跳过确认；默认必须手动确认，防手滑
-if [ "${UNINSTALL_CONFIRM:-}" != "yes" ]; then
-ask_yes "确认卸载吗" "n" || { say_info "已取消"; return 1;}
-fi
-# 先记下规则里的端口：稍后回收对应的防火墙放行规则，
-# 记晚了（CONF_DIR 删掉之后）就找不到了
-local ports="" p
-if [ -f "$RULES_FILE" ]; then
-ports="$(grep -v '^#' "$RULES_FILE" 2>/dev/null | grep -v '^$' 2>/dev/null | cut -d'|' -f1 | tr '\n' ' ' || true)"
-fi
-service_stop >/dev/null 2>&1 || true
-if [ "$INIT_SYSTEM" = "openrc" ]; then
-rc-update del realm default >/dev/null 2>&1 || true
-rm -f /etc/init.d/realm
-else
-systemctl disable realm >/dev/null 2>&1 || true
-rm -f /etc/systemd/system/realm.service
-systemctl daemon-reload >/dev/null 2>&1 || true
-fi
-for p in $ports; do close_firewall "$p"; done  # 回收所有规则放行的端口
-# 端口跳跃：清空清单再生成一遍 hop.sh，跑一下就把 ZHUANFA_HOP 链整条删掉了
-if [ -f "$HOP_SCRIPT" ]; then
-    rm -f "$HOP_FILE"
-    write_hop_script && run_hop_script
-fi
-save_firewall
-rm -f "$BIN_PATH" "$SHORTCUT"
-rm -rf "$CONF_DIR"
-say_ok "卸载完成，干干净净"
+    say_warn "即将删除：realm 程序、系统服务、全部转发规则和配置"
+    # 非交互卸载时传 UNINSTALL_CONFIRM=yes 跳过确认；默认必须手动确认，防手滑
+    if [ "${UNINSTALL_CONFIRM:-}" != "yes" ]; then
+        ask_yes "确认卸载吗" "n" || { say_info "已取消"; return 1; }
+    fi
+    # 收集规则清单和防火墙登记表里的全部端口（去重），避免遗漏孤儿规则
+    local ports="" p had_hop=0 _p _a _rp _n
+    ports="$(
+        {
+            if [ -f "$RULES_FILE" ]; then
+                while IFS='|' read -r _p _a _rp _n || [ -n "${_p:-}" ]; do
+                    is_port "${_p:-}" && printf '%s\n' "$_p"
+                done < "$RULES_FILE"
+            fi
+            if [ -f "$FIREWALL_FILE" ]; then
+                awk -F'|' '$1 ~ /^[1-9][0-9]*$/ { print $1 }' "$FIREWALL_FILE"
+            fi
+        } | sort -u | tr '\n' ' '
+    )"
+    service_stop >/dev/null 2>&1 || true
+    if [ "$INIT_SYSTEM" = "openrc" ]; then
+        rc-update del realm default >/dev/null 2>&1 || true
+        rm -f "$OPENRC_INIT"
+    else
+        systemctl disable realm >/dev/null 2>&1 || true
+        rm -f "$SYSTEMD_UNIT"
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+    for p in $ports; do
+        close_firewall "$p"
+    done
+    # 端口跳跃：清空清单再生成一遍 hop.sh，跑一下就把 ZHUANFA_HOP 链整条删掉了
+    if [ -f "$HOP_SCRIPT" ] || [ -f "$HOP_FILE" ]; then
+        had_hop=1
+        rm -f "$HOP_FILE"
+        write_hop_script && run_hop_script || true
+    fi
+    # 只有清过跳跃规则时才顺手存盘（且不安装任何新包）
+    [ "$had_hop" -eq 1 ] && save_firewall 0
+    rm -f "$BIN_PATH" "$SHORTCUT"
+    rm -rf "$CONF_DIR"
+    say_ok "卸载完成，干干净净"
 }
 
 show_status() {
-echo ""
-say_info "========== 运行状态 =========="
-if [ -x "$BIN_PATH" ]; then echo " realm 程序：已安装（${BIN_PATH}）"
-else echo " realm 程序：未安装（先选菜单 1 安装）"; fi
-if service_is_active; then echo " 服务状态：运行中"
-else echo " 服务状态：未运行"; fi
-if service_is_enabled; then echo " 开机自启：已开启"
-else echo " 开机自启：未开启"; fi
-echo ""
-say_info "正在监听的端口（realm 的）："
-if ss -tlnp 2>/dev/null | grep -q "realm"; then
-ss -tlnp 2>/dev/null | grep "realm" | sed 's/^/ /'
-else
-say_info " （没有）"
-fi
+    echo ""
+    say_info "========== 运行状态 =========="
+    if [ -x "$BIN_PATH" ]; then
+        echo " realm 程序：已安装（${BIN_PATH}）"
+    else
+        echo " realm 程序：未安装（先选菜单 1 安装）"
+    fi
+    if service_is_active; then
+        echo " 服务状态：运行中"
+    else
+        echo " 服务状态：未运行"
+    fi
+    if service_is_enabled; then
+        echo " 开机自启：已开启"
+    else
+        echo " 开机自启：未开启"
+    fi
+    echo ""
+    say_info "正在监听的端口（realm，TCP/UDP）："
+    local listening
+    listening="$({ ss -tlnp 2>/dev/null; ss -ulnp 2>/dev/null; } | grep -F '"realm"' || true)"
+    if [ -n "$listening" ]; then
+        printf '%s\n' "$listening" | sed 's/^/  /'
+    elif [ "$(id -u)" -ne 0 ]; then
+        say_info " （当前不是 root，无法查看具体进程名；请用 sudo zhuanfa 或 root 运行）"
+    else
+        say_info " （没有）"
+    fi
+    if [ -f "$HOP_FILE" ] && grep -q '^[1-9]' "$HOP_FILE"; then
+        echo ""
+        say_info "端口跳跃规则（UDP）："
+        local p s e
+        while IFS='|' read -r p s e || [ -n "${p:-}" ]; do
+            is_port "$p" && is_port "$s" && is_port "$e" || continue
+            echo "  本机 UDP ${s}-${e}  →  中转端口 ${p}"
+        done < "$HOP_FILE"
+        if [ "$(id -u)" -eq 0 ] && command -v iptables >/dev/null 2>&1; then
+            if iptables -w 5 -t nat -S ZHUANFA_HOP >/dev/null 2>&1; then
+                say_ok "iptables 跳跃链（ZHUANFA_HOP）已加载"
+            else
+                say_warn "iptables 跳跃链（ZHUANFA_HOP）未加载，可运行：sh $HOP_SCRIPT"
+            fi
+        fi
+    fi
 }
 
 # ==================== 主菜单 ====================
 show_menu() {
-while true; do
-echo ""
-echo "========== 端口转发管理菜单 =========="
-if service_is_active; then echo " realm 状态：运行中"
-else echo " realm 状态：未运行"; fi
-echo ""
-echo " 1. 安装 / 更新 realm（第一次用先选这个）"
-echo " 2. 添加转发规则（支持 Hysteria2 端口跳跃）"
-echo " 3. 查看转发规则"
-echo " 4. 删除转发规则"
-echo " 5. 重启 realm 服务"
-echo " 6. 查看运行状态"
-echo " 7. 卸载（删除 realm 和所有规则）"
-echo " 0. 退出"
-echo "======================================"
-local c=""
-read -rp "请选择 [0-7]: " c || { say_info "输入已结束，退出菜单"; return 0; }
-case "$c" in
-1) do_install;;
-2) add_rule;;
-3) list_rules; read -rp "按回车返回…" _;;
-4) del_rule;;
-5) if service_restart; then say_ok "服务已重启"; else say_err "重启失败，用菜单 6 看看"; fi;;
-6) show_status; read -rp "按回车返回…" _;;
-7) do_uninstall;;
-0) say_info "再见"; exit 0;;
-*) say_err "请输入 0~7 的数字";;
-esac
-done
+    while true; do
+        echo ""
+        echo "========== 端口转发管理菜单 =========="
+        if service_is_active; then
+            echo " realm 状态：运行中"
+        else
+            echo " realm 状态：未运行"
+        fi
+        echo ""
+        echo " 1. 安装 / 更新 realm（第一次用先选这个）"
+        echo " 2. 添加转发规则（支持 Hysteria2 端口跳跃）"
+        echo " 3. 查看转发规则"
+        echo " 4. 删除转发规则"
+        echo " 5. 重启 realm 服务"
+        echo " 6. 查看运行状态"
+        echo " 7. 卸载（删除 realm 和所有规则）"
+        echo " 0. 退出"
+        echo "======================================"
+        local c=""
+        read -rp "请选择 [0-7]: " c || { say_info "输入已结束，退出菜单"; return 0; }
+        c="$(printf '%s' "$c" | tr -d '[:space:]')"
+        case "$c" in
+            1) do_install ;;
+            2) add_rule ;;
+            3) list_rules || true; read -rp "按回车返回…" _ || return 0 ;;
+            4) del_rule ;;
+            5) do_restart ;;
+            6) show_status; read -rp "按回车返回…" _ || return 0 ;;
+            7) if do_uninstall; then return 0; fi ;;
+            0) say_info "再见"; exit 0 ;;
+            *) say_err "请输入 0~7 的数字" ;;
+        esac
+    done
 }
 
 # ==================== 入口 ====================
 main() {
-# 参数优先，其次环境变量 ACTION，都没有就进交互菜单。
-# 比如：bash install.sh install / ACTION=add LISTEN_PORT=... bash install.sh
-local action="${1:-${ACTION:-}}"
-case "$action" in
-install) do_install;;
-uninstall) need_root; detect_os; do_uninstall;;
-add) need_root; detect_os; install_deps; add_rule;;
-del) need_root; detect_os; del_rule;;
-list) list_rules;;
-restart) need_root; detect_os; if service_restart; then say_ok "已重启"; else say_err "重启失败"; fi;;
-status) detect_os; show_status;;
-""|menu)
-# 没给参数 → 进交互菜单。但如果是管道方式运行（stdin 不是终端），
-# read 会直接读到 EOF，菜单会瞎转。与其这样，不如直接告诉正确的打开方式。
-if [ ! -t 0 ]; then
-say_err "检测到不是交互终端，菜单需要键盘输入，进不去。"
-say_info '不要用 管道 | bash 的方式运行，请复制 README 里的"一键运行"命令。'
-exit 1
-fi
-need_root; detect_os; install_deps
-# 用一键命令跑了新版脚本，但 zhuanfa 还是老版本？顺手更新，免得下次用 zhuanfa 又回到老功能
-if [ -f "$SHORTCUT" ] && [ -f "$0" ] && ! cmp -s "$0" "$SHORTCUT"; then install_shortcut; fi
-show_menu;;
-*) say_err "未知参数：${action}（可用：install / add / del / list / restart / status / uninstall）"; exit 1;;
-esac
+    # 参数优先，其次环境变量 ACTION，都没有就进交互菜单。
+    # 比如：bash install.sh install / ACTION=add LISTEN_PORT=... bash install.sh
+    local action="${1:-${ACTION:-}}"
+    case "$action" in
+        install)
+            do_install
+            ;;
+        uninstall)
+            need_root; detect_os; do_uninstall
+            ;;
+        add)
+            need_root; detect_os; install_deps || exit 1; add_rule
+            ;;
+        del)
+            need_root; detect_os; del_rule
+            ;;
+        list)
+            list_rules || true
+            ;;
+        restart)
+            need_root; detect_os; do_restart
+            ;;
+        status)
+            detect_os; show_status
+            ;;
+        ""|menu)
+            # 没给参数 → 进交互菜单。但如果是管道方式运行（stdin 不是终端），
+            # read 会直接读到 EOF，菜单会瞎转。与其这样，不如直接告诉正确的打开方式。
+            if [ ! -t 0 ]; then
+                say_err "检测到不是交互终端，菜单需要键盘输入，进不去。"
+                say_info '不要用 管道 | bash 的方式运行，请复制 README 里的"一键运行"命令。'
+                exit 1
+            fi
+            need_root; detect_os; install_deps || exit 1
+            # 用一键命令跑了新版脚本，但 zhuanfa 还是老版本？顺手更新，免得下次用 zhuanfa 又回到老功能
+            if [ -f "$SHORTCUT" ] && [ -f "$0" ] && ! [ "$0" -ef "$SHORTCUT" ] && ! cmp -s "$0" "$SHORTCUT"; then
+                install_shortcut || true
+            fi
+            show_menu
+            ;;
+        *)
+            say_err "未知参数：${action}（可用：install / add / del / list / restart / status / uninstall）"
+            exit 1
+            ;;
+    esac
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

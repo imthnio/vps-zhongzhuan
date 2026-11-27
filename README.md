@@ -17,9 +17,3 @@ sh -c 'set -e; if [ "$(id -u)" -eq 0 ]; then run=""; elif command -v sudo >/dev/
 5. 客户端里服务器地址改成 `B的IP:20000-50000`（Clash Meta 写 `port: 443` 再加 `ports: 20000-50000`），密码、SNI 等其他参数照旧
 
 不想用跳跃也可以：第 3 步选 `n`，客户端填 `B的IP:443` 就行。
-
-## 赞赏支持
-如果这个脚本帮到了你，欢迎请我喝杯咖啡 ☕  
-微信扫一扫下方赞赏码即可：
-
-![赞赏码](./appreciate.png)
